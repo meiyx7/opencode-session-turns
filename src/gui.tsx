@@ -6,10 +6,22 @@ import { Portal } from "solid-js/web"
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v10"
+const VERSION = "v11"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
+
+// paging: a full load walks every page; a light refresh pulls just the newest
+// page (new messages always land at the head of a desc listing).
+const FULL_PAGE_LIMIT = 40
+const FULL_PAGE_SIZE = 200
+const LIGHT_PAGE_SIZE = 50
+
+// jump loop budgets
+const JUMP_ROUNDS = 30
+const JUMP_TOTAL_MS = 15000
+const JUMP_ROW_TIMEOUT_MS = 6000
+const SAME_TARGET_WINDOW_MS = 800
 
 // Filled by Rail.load()/jump() so the command palette can report diagnostics.
 let lastTurnCount = 0
@@ -143,14 +155,52 @@ const CSS = `
   overflow-y: auto;
   overflow-x: hidden;
   scrollbar-width: none;
+  /* keep wheel scrolling from chaining into the host timeline when the rail
+     reaches its own end */
+  overscroll-behavior: contain;
   z-index: 400;
   border-radius: 10px;
   color: var(--text-base, currentColor);
   background: transparent;
-  transition: width .18s ease;
+  transition: width .18s ease, background .18s ease, box-shadow .18s ease;
 }
 .sr-rail::-webkit-scrollbar { display: none; }
-.sr-rail[data-open="true"] { width: 360px; background: transparent; }
+.sr-rail[data-open="true"] {
+  width: 360px;
+  padding: 10px 8px;
+  justify-content: flex-start;
+  background: var(--surface-base, rgba(125,125,125,.16));
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow: 0 6px 28px rgba(0,0,0,.22);
+}
+.sr-head {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 2px 6px;
+  margin-bottom: 4px;
+  border-bottom: 1px solid rgba(127,127,127,.22);
+  flex-shrink: 0;
+  width: 100%;
+}
+.sr-rail[data-open="true"] .sr-head { display: flex; }
+.sr-title { font-size: 11px; opacity: .55; white-space: nowrap; }
+.sr-close {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 7px;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: .5;
+  flex-shrink: 0;
+}
+.sr-close:hover { opacity: 1; background: var(--surface-base-hover, rgba(127,127,127,.14)); }
 .sr-turn {
   display: flex;
   align-items: center;
@@ -166,6 +216,7 @@ const CSS = `
   font: inherit;
   border-radius: 4px;
 }
+.sr-turn:focus-visible, .sr-close:focus-visible { outline: 1px solid currentColor; outline-offset: -1px; }
 .sr-dash {
   display: block;
   width: 10px;
@@ -194,6 +245,7 @@ const CSS = `
   background: transparent;
 }
 .sr-rail[data-open="true"] .sr-text { display: block; }
+.sr-num { opacity: .75; margin-right: 5px; font-variant-numeric: tabular-nums; }
 .sr-turn:hover .sr-text {
   opacity: 1;
   background: var(--surface-base-hover, rgba(127,127,127,.14));
@@ -203,6 +255,19 @@ const CSS = `
   font-weight: 600;
   background: var(--surface-base-hover, rgba(127,127,127,.14));
 }
+/* brief highlight of the row a jump landed on */
+.sr-flash-target { animation: srPulse 1.5s ease-out 1; }
+@keyframes srPulse {
+  0%, 30% { background: rgba(255,170,60,.4); }
+  100% { background: transparent; }
+}
+.sr-note {
+  display: none;
+  font-size: 11px;
+  opacity: .4;
+  padding: 2px;
+}
+.sr-rail[data-open="true"] .sr-note { display: block; }
 .sr-status {
   position: fixed;
   right: 30px;
@@ -218,7 +283,6 @@ const CSS = `
   white-space: pre-wrap;
   max-width: min(720px, 90vw);
 }
-.sr-note { font-size: 11px; opacity: .4; padding: 2px; }
 `
 
 // ---------------------------------------------------------------------------
@@ -233,93 +297,214 @@ function Rail(props) {
   const [note, setNote] = createSignal("")
   const [status, setStatus] = createSignal("")
 
-  let loading = false
+  // ---- turn cache ---------------------------------------------------------
+  // Object identity is kept stable across refreshes so Solid's <For> reuses
+  // existing DOM instead of rebuilding the whole list on every update.
+  const cache = new Map()
+  let loadToken = 0
+  let loadingActive = false
+  let pendingBump = false
   let loadedFor = ""
-  let closeTimer
-  // The memory router's hash is invisible to us (window.location is stale), so
-  // track the last id we navigated to in order to force a hash change each round.
-  let lastNavID = ""
+  let lightTimer
 
-  const load = async (sessionID) => {
-    if (!sessionID || loading) return
-    loading = true
-    const collected = new Map()
-    let cursor
+  const sessionID = () => props.session()?.id
+
+  const publish = () => {
+    const list = [...cache.values()].sort((a, b) => a.created - b.created)
+    const prev = untrack(turns)
+    // Skip the signal write when nothing changed; <For> diffs by reference.
+    if (prev.length === list.length && prev.every((item, i) => item === list[i])) return
+    setTurns(list)
+    lastTurnCount = list.length
+  }
+
+  const upsert = (item) => {
+    const existing = cache.get(item.id)
+    if (existing && existing.created === item.time && existing.text === item.text) return
+    cache.set(item.id, { id: item.id, created: item.time, text: item.text })
+  }
+
+  const fetchPage = async (id, limit, cursor) => {
+    // The server rejects `cursor` together with `order`
+    // (InvalidCursorError: "Cursor cannot be combined with order").
+    // The cursor itself already encodes the original order/direction,
+    // so only the first page declares order: "desc".
+    const params = cursor
+      ? { sessionID: id, type: "user", limit, cursor }
+      : { sessionID: id, type: "user", limit, order: "desc" }
+    return await ctx.client.message.list(params)
+  }
+
+  const load = async (id, mode) => {
+    const token = ++loadToken
+    loadingActive = true
     let error = ""
     try {
-      for (let page = 0; page < 40; page++) {
-        // The server rejects `cursor` together with `order`
-        // (InvalidCursorError: "Cursor cannot be combined with order").
-        // The cursor itself already encodes the original order/direction,
-        // so only the first page declares order: "desc".
-        const params = cursor
-          ? { sessionID, type: "user", limit: 200, cursor }
-          : { sessionID, type: "user", limit: 200, order: "desc" }
-
+      let cursor
+      const pages = mode === "full" ? FULL_PAGE_LIMIT : 1
+      const limit = mode === "full" ? FULL_PAGE_SIZE : LIGHT_PAGE_SIZE
+      let cleared = mode !== "full"
+      for (let page = 0; page < pages; page++) {
         let response
         try {
-          response = await ctx.client.message.list(params)
+          response = await fetchPage(id, limit, cursor)
         } catch (cause) {
           error = String(cause?.message ?? cause)
           break
         }
-
-        const data = response?.data ?? []
+        // Superseded by a newer load (or a session switch): drop this page
+        // instead of polluting the new session's cache with stale ids.
+        if (token !== loadToken) return
+        // Full mode clears only after the first page succeeded, so a server
+        // error never blanks out the rail (v10's hard-won lesson).
+        if (!cleared) {
+          cache.clear()
+          cleared = true
+        }
         let fresh = 0
-        for (const message of data) {
-          if (collected.has(message.id)) continue
-          collected.set(message.id, {
-            id: message.id,
-            created: message.time?.created ?? 0,
-            text: firstLine(message),
-          })
+        for (const message of response?.data ?? []) {
+          if (cache.has(message.id)) continue
+          upsert({ id: message.id, time: message.time?.created ?? 0, text: firstLine(message) })
           fresh++
         }
+        // Publish page by page: long sessions appear progressively instead of
+        // popping in all at once after every page has been fetched.
+        publish()
         const next = response?.cursor?.next
         if (!next || fresh === 0) break
         cursor = next
       }
     } finally {
-      loading = false
+      loadingActive = false
+      loadedFor = id
+      lastNote = error
+      setNote(cache.size === 0 ? error || "暂无用户消息" : "")
+      // A message arrived while a full load was running: catch up now.
+      if (pendingBump) {
+        pendingBump = false
+        scheduleLight()
+      }
     }
-
-    // Publish whatever was collected even if a later page failed — a paging
-    // error must never blank out the whole rail again.
-    const list = [...collected.values()].sort((a, b) => a.created - b.created)
-    setTurns(list)
-    lastTurnCount = list.length
-    lastNote = error
-    setNote(list.length === 0 ? error || "暂无用户消息" : "")
-    loadedFor = sessionID
   }
 
-  const sessionID = () => props.session()?.id
+  // ---- event-driven refresh (replaces the 5s full-list polling) -----------
+  // The SDK shares one SSE connection with the host; consuming it here is a
+  // second iterator over the same stream, not a second connection. Events are
+  // debounced into a single-page light refresh, so streaming bursts cost
+  // nothing beyond a few cheap `type` comparisons per event.
+  const scheduleLight = () => {
+    if (lightTimer) return
+    lightTimer = setTimeout(() => {
+      lightTimer = undefined
+      const id = untrack(sessionID)
+      if (id) void load(id, "light")
+    }, 300)
+  }
+
+  const bump = (eventSessionID) => {
+    // Only the session currently shown matters; ignore everything else.
+    if (!eventSessionID || eventSessionID !== untrack(sessionID)) return
+    if (loadingActive) {
+      pendingBump = true
+      return
+    }
+    scheduleLight()
+  }
+
+  const handleEvent = (event) => {
+    const type = event?.type
+    if (type === "message.updated") {
+      const data = event?.data ?? {}
+      const info = data.info
+      // Fast path: the payload carries the message itself, so a new user turn
+      // shows up instantly; the debounced light refresh reconciles the rest.
+      if (info?.role === "user" && info?.id) {
+        upsert({ id: info.id, time: info.time?.created ?? 0, text: firstLine(info) })
+        publish()
+      }
+      bump(data.sessionID)
+    } else if (type === "message.removed") {
+      const data = event?.data ?? {}
+      if (data.messageID && cache.delete(data.messageID)) publish()
+      bump(data.sessionID)
+    } else if (type === "location.shutdown") {
+      // Server rebuilt: do one full reload of the current session.
+      const id = untrack(sessionID)
+      if (id && loadedFor === id) void load(id, "full")
+    }
+  }
+
+  onMount(() => {
+    let stopped = false
+    let attempt = 0
+    let retryTimer
+    const run = async () => {
+      while (!stopped) {
+        const stream = ctx.client.event.subscribe()
+        const iterator = stream[Symbol.asyncIterator]()
+        try {
+          while (!stopped) {
+            const next = await iterator.next()
+            if (next.done) break
+            attempt = 0
+            handleEvent(next.value)
+          }
+        } catch {}
+        // iterator.return() cancels the SSE reader (the SDK's generator
+        // finally-block); errors from it are irrelevant at this point.
+        try {
+          await iterator.return?.()
+        } catch {}
+        if (stopped) break
+        attempt++
+        await sleep(Math.min(2000 * attempt, 15000))
+      }
+    }
+    void run()
+    onCleanup(() => {
+      stopped = true
+      clearTimeout(retryTimer)
+      if (lightTimer) clearTimeout(lightTimer)
+    })
+  })
 
   createEffect(() => {
     const id = sessionID()
     if (!id) return
     untrack(() => {
       if (loadedFor !== id) {
+        // Invalidate anything in flight for the previous session first, so its
+        // finally-block can't write `loadedFor`/`note` for the wrong session.
+        loadToken++
+        loadingActive = false
+        pendingBump = false
+        cache.clear()
         setTurns([])
         setActive("")
         lastNavID = ""
-        void load(id)
+        void load(id, "full")
       }
     })
   })
 
-  const poll = setInterval(() => {
-    const id = sessionID()
-    if (id) void load(id)
-  }, 5000)
-  onCleanup(() => clearInterval(poll))
+  // ---- active-turn tracking ----------------------------------------------
+  // Driven by scroll events (captured at document level so it also sees the
+  // real scroller without querying first) plus one rAF-throttled pass, with a
+  // slow interval as a fallback for rows mounting without a scroll (history
+  // paging, virtual list swaps).
+  let scrollerCache
+  const scroller = () => {
+    if (scrollerCache?.isConnected) return scrollerCache
+    scrollerCache = findScroller()
+    return scrollerCache
+  }
 
   const trackActive = () => {
-    const scroller = findScroller()
-    if (!scroller) return
-    const rows = [...scroller.querySelectorAll("[data-message-id]")]
+    const sc = scroller()
+    if (!sc) return
+    const rows = sc.querySelectorAll("[data-message-id]")
     if (rows.length === 0) return
-    const top = scroller.getBoundingClientRect().top + 40
+    const top = sc.getBoundingClientRect().top + 40
     for (const row of rows) {
       if (row.getBoundingClientRect().bottom >= top) {
         const id = row.getAttribute("data-message-id")
@@ -328,31 +513,97 @@ function Rail(props) {
       }
     }
   }
-  const track = setInterval(trackActive, 400)
-  onCleanup(() => clearInterval(track))
 
-  const flash = (text) => {
-    setStatus(text)
-    setTimeout(() => setStatus((current) => (current === text ? "" : current)), 3000)
+  let rafPending = false
+  const scheduleTrack = () => {
+    if (rafPending) return
+    rafPending = true
+    requestAnimationFrame(() => {
+      rafPending = false
+      trackActive()
+    })
   }
 
   onMount(() => {
-    const onDiag = () => flash(`${VERSION} · ${diagnostics(ctx)}`)
-    const onOpen = () => {
-      setOpen(true)
-      clearTimeout(closeTimer)
-      closeTimer = setTimeout(() => setOpen(false), 4000)
+    const onScroll = () => scheduleTrack()
+    document.addEventListener("scroll", onScroll, true)
+    const fallback = setInterval(scheduleTrack, 1500)
+    onCleanup(() => {
+      document.removeEventListener("scroll", onScroll, true)
+      clearInterval(fallback)
+    })
+  })
+
+  // ---- status flash -------------------------------------------------------
+  // A sequence guard so a slow timeout from an earlier flash can never clear a
+  // newer message.
+  let flashSeq = 0
+  const flash = (text, ms = 2600) => {
+    const seq = ++flashSeq
+    setStatus(text)
+    setTimeout(() => {
+      if (seq === flashSeq) setStatus("")
+    }, ms)
+  }
+
+  // ---- open / close interactions ------------------------------------------
+  onMount(() => {
+    const onKey = (event) => {
+      if (event.key !== "Escape") return
+      if (untrack(open)) {
+        setOpen(false)
+        // Only swallow Esc while the rail is actually open, so the host keeps
+        // its own Escape handling the rest of the time.
+        event.stopPropagation()
+      }
     }
+    const onPointerDown = (event) => {
+      if (!untrack(open)) return
+      const path = event.composedPath?.() ?? []
+      const inside = path.some((node) => node instanceof Element && node.closest?.(".sr-rail"))
+      if (!inside) setOpen(false)
+    }
+    window.addEventListener("keydown", onKey, true)
+    document.addEventListener("pointerdown", onPointerDown, true)
+    onCleanup(() => {
+      window.removeEventListener("keydown", onKey, true)
+      document.removeEventListener("pointerdown", onPointerDown, true)
+    })
+  })
+
+  onMount(() => {
+    const onDiag = () => flash(`${VERSION} · ${diagnostics(ctx)}`)
+    // /turns toggles the panel; Esc / outside click / × also close it. No more
+    // forced auto-close after 4s.
+    const onOpen = () => setOpen((value) => !value)
     window.addEventListener(DIAG_EVENT, onDiag)
     window.addEventListener(OPEN_EVENT, onOpen)
     onCleanup(() => {
       window.removeEventListener(DIAG_EVENT, onDiag)
       window.removeEventListener(OPEN_EVENT, onOpen)
-      clearTimeout(closeTimer)
     })
     // One-shot confirmation that this window actually runs the rebuilt bundle.
     flash(`会话轮次 ${VERSION} 已加载`)
   })
+
+  // ---- jump ----------------------------------------------------------------
+  // The memory router's hash is invisible to us (window.location is stale), so
+  // track the last id we navigated to in order to force a hash change each round.
+  let lastNavID = ""
+  let jumpToken = 0
+  let lastJumpAt = 0
+  let lastJumpTurnID = ""
+
+  // Brief highlight on the row a jump landed on. The row may be unmounted by
+  // the virtual list right after; the timer then just no-ops.
+  const pulse = (row) => {
+    try {
+      row.classList.remove("sr-flash-target")
+      void row.offsetWidth // restart the animation when re-pulsing the same row
+      row.classList.add("sr-flash-target")
+      setTimeout(() => row.classList.remove("sr-flash-target"), 1600)
+    } catch {}
+  }
 
   // Oldest turn that is currently mounted (i.e. already paged in), used as a
   // safe "different id" to toggle the router hash so it re-runs its seek.
@@ -366,14 +617,63 @@ function Rail(props) {
     lastNavID = id
   }
 
+  // Resolves when the row enters the DOM (MutationObserver, with a cheap poll
+  // as a belt-and-braces fallback), or null on timeout / supersession.
+  const waitForRow = (messageID, token, timeout) =>
+    new Promise((resolve) => {
+      let done = false
+      let observer
+      let poll
+      let timer
+      const finish = (row) => {
+        if (done) return
+        done = true
+        try {
+          observer?.disconnect()
+        } catch {}
+        clearInterval(poll)
+        clearTimeout(timer)
+        resolve(row ?? null)
+      }
+      const check = () => {
+        if (token !== jumpToken) return finish(null)
+        const row = findRow(messageID)
+        if (row) finish(row)
+      }
+      const existing = findRow(messageID)
+      if (existing) return finish(existing)
+      observer = new MutationObserver(check)
+      observer.observe(document.documentElement, { childList: true, subtree: true })
+      poll = setInterval(check, 120)
+      timer = setTimeout(() => finish(findRow(messageID)), Math.max(400, timeout))
+    })
+
   const jump = async (turn) => {
+    const token = ++jumpToken
     lastJumpID = turn.id
-    const scroller = findScroller()
+    const now = Date.now()
+
+    // Same target clicked again shortly after: treat as idempotent re-scroll
+    // instead of restarting the paging loop.
+    if (turn.id === lastJumpTurnID && now - lastJumpAt < SAME_TARGET_WINDOW_MS) {
+      const row = findRow(turn.id)
+      const sc = scroller()
+      if (row && sc) {
+        scrollToRow(sc, row)
+        pulse(row)
+        return
+      }
+    }
+    lastJumpAt = now
+    lastJumpTurnID = turn.id
+
+    const sc = scroller()
     const row = findRow(turn.id)
 
     // Fast path: the row is mounted, scroll locally.
-    if (row && scroller) {
-      scrollToRow(scroller, row)
+    if (row && sc) {
+      scrollToRow(sc, row)
+      pulse(row)
       flash("已定位")
       return
     }
@@ -387,7 +687,10 @@ function Rail(props) {
     // The host only pages in ~one history page (~5 turns) per seek and then goes
     // idle. Drive it: each round toggles the hash to an already-loaded turn and
     // back to the target, so the cursor machine runs another seek/page.
-    for (let round = 0; round < 30; round++) {
+    // A newer click bumps jumpToken, which cancels this loop at every await.
+    const deadline = Date.now() + JUMP_TOTAL_MS
+    for (let round = 0; round < JUMP_ROUNDS && Date.now() < deadline; round++) {
+      if (token !== jumpToken) return
       flash(round === 0 ? "定位中…" : `加载历史… ${round}`)
 
       if (lastNavID === turn.id) {
@@ -397,20 +700,22 @@ function Rail(props) {
           await sleep(120)
         }
       }
+      if (token !== jumpToken) return
       navTo(path, turn.id)
 
-      for (let k = 0; k < 6; k++) {
-        await sleep(80)
-        const landed = findRow(turn.id)
-        if (!landed) continue
-        const live = findScroller() ?? scroller
+      const remaining = Math.min(JUMP_ROW_TIMEOUT_MS, deadline - Date.now())
+      const landed = await waitForRow(turn.id, token, remaining)
+      if (token !== jumpToken) return
+      if (landed) {
+        const live = scroller() ?? sc
         if (live) scrollToRow(live, landed)
+        pulse(landed)
         flash("已定位")
         return
       }
     }
 
-    flash(`未能定位 · ${diagnostics(ctx)}`)
+    if (token === jumpToken) flash(`未能定位 · ${diagnostics(ctx)}`)
   }
 
   const rail = (
@@ -424,9 +729,15 @@ function Rail(props) {
         onMouseEnter={() => setOpen(true)}
         onMouseLeave={() => setOpen(false)}
       >
+        <div class="sr-head">
+          <span class="sr-title">会话轮次{turns().length > 0 ? ` · ${turns().length}` : ""}</span>
+          <button type="button" class="sr-close" title="关闭 (Esc)" onClick={() => setOpen(false)}>
+            ×
+          </button>
+        </div>
         <Show when={turns().length > 0} fallback={<div class="sr-note">{note() || `… ${VERSION}`}</div>}>
           <For each={turns()}>
-            {(turn) => (
+            {(turn, index) => (
               <button
                 type="button"
                 class="sr-turn"
@@ -434,6 +745,7 @@ function Rail(props) {
                 onClick={() => void jump(turn)}
               >
                 <span class="sr-text">
+                  <span class="sr-num">#{index() + 1}</span>
                   {formatTime(turn.created)} {turn.text}
                 </span>
                 <span class="sr-dash" />
@@ -486,7 +798,6 @@ export default Plugin.define({
       slash: { name: "turns" },
       run: () => {
         window.dispatchEvent(new Event(OPEN_EVENT))
-        window.dispatchEvent(new Event(DIAG_EVENT))
       },
     }))
   },
