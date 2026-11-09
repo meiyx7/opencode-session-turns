@@ -143,50 +143,43 @@ const CSS = `
   position: fixed;
   top: 50%;
   transform: translateY(-50%);
-  right: 10px;
-  max-height: 60vh;
-  width: 14px;
+  right: 14px;
+  max-height: 66vh;
+  width: 16px;
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
   justify-content: center;
-  gap: 2px;
-  padding: 8px 4px;
-  overflow-y: auto;
-  overflow-x: hidden;
-  scrollbar-width: none;
-  /* keep wheel scrolling from chaining into the host timeline when the rail
-     reaches its own end */
-  overscroll-behavior: contain;
+  padding: 6px 2px;
+  overflow: hidden;
   z-index: 400;
   border-radius: 10px;
+  border: 1px solid transparent;
   color: var(--text-base, currentColor);
   background: transparent;
-  transition: width .18s ease, background .18s ease, box-shadow .18s ease;
+  transition: width .18s ease, background .18s ease, box-shadow .18s ease, border-color .18s ease;
 }
-.sr-rail::-webkit-scrollbar { display: none; }
 .sr-rail[data-open="true"] {
-  width: 360px;
-  padding: 10px 8px;
+  width: 340px;
+  padding: 10px;
   justify-content: flex-start;
-  background: var(--surface-base, rgba(125,125,125,.16));
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  box-shadow: 0 6px 28px rgba(0,0,0,.22);
+  background: var(--surface-base, rgba(24,24,26,.86));
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-color: rgba(127,127,127,.25);
+  box-shadow: 0 8px 32px rgba(0,0,0,.28);
 }
 .sr-head {
   display: none;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 0 2px 6px;
-  margin-bottom: 4px;
-  border-bottom: 1px solid rgba(127,127,127,.22);
+  padding: 0 2px 8px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid rgba(127,127,127,.2);
   flex-shrink: 0;
-  width: 100%;
 }
 .sr-rail[data-open="true"] .sr-head { display: flex; }
-.sr-title { font-size: 11px; opacity: .55; white-space: nowrap; }
+.sr-title { font-size: 12px; opacity: .6; white-space: nowrap; }
 .sr-close {
   border: 0;
   background: transparent;
@@ -201,6 +194,26 @@ const CSS = `
   flex-shrink: 0;
 }
 .sr-close:hover { opacity: 1; background: var(--surface-base-hover, rgba(127,127,127,.14)); }
+/* the scrollable list; the header stays fixed above it */
+.sr-list {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: none;
+}
+.sr-rail[data-open="true"] .sr-list { justify-content: flex-start; gap: 1px; scrollbar-width: thin; }
+.sr-list::-webkit-scrollbar { display: none; }
+.sr-rail[data-open="true"] .sr-list::-webkit-scrollbar { display: block; width: 8px; }
+.sr-list::-webkit-scrollbar-track { background: transparent; }
+.sr-rail[data-open="true"] .sr-list::-webkit-scrollbar-thumb {
+  background: rgba(127,127,127,.35);
+  border-radius: 4px;
+}
 .sr-turn {
   display: flex;
   align-items: center;
@@ -216,6 +229,15 @@ const CSS = `
   font: inherit;
   border-radius: 4px;
 }
+/* expanded: dash flips to a left-side indicator, content reads left-to-right */
+.sr-rail[data-open="true"] .sr-turn {
+  flex-direction: row-reverse;
+  justify-content: flex-start;
+  gap: 9px;
+  padding: 5px 8px;
+  min-height: 0;
+  border-radius: 6px;
+}
 .sr-turn:focus-visible, .sr-close:focus-visible { outline: 1px solid currentColor; outline-offset: -1px; }
 .sr-dash {
   display: block;
@@ -225,10 +247,13 @@ const CSS = `
   background: currentColor;
   opacity: .28;
   flex-shrink: 0;
-  transition: opacity .12s ease, width .12s ease;
+  transition: opacity .12s ease, width .12s ease, height .12s ease;
 }
 .sr-turn:hover .sr-dash,
 .sr-turn[data-active="true"] .sr-dash { opacity: .95; width: 18px; }
+.sr-rail[data-open="true"] .sr-dash { width: 3px; height: 16px; }
+.sr-rail[data-open="true"] .sr-turn:hover .sr-dash,
+.sr-rail[data-open="true"] .sr-turn[data-active="true"] .sr-dash { width: 3px; height: 22px; }
 .sr-text {
   display: none;
   margin-right: 10px;
@@ -244,17 +269,30 @@ const CSS = `
   opacity: .45;
   background: transparent;
 }
-.sr-rail[data-open="true"] .sr-text { display: block; }
-.sr-num { opacity: .75; margin-right: 5px; font-variant-numeric: tabular-nums; }
-.sr-turn:hover .sr-text {
-  opacity: 1;
-  background: var(--surface-base-hover, rgba(127,127,127,.14));
+.sr-rail[data-open="true"] .sr-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  text-align: left;
+  white-space: normal;
+  line-height: 1.45;
+  max-width: none;
+  opacity: .8;
 }
-.sr-turn[data-active="true"] .sr-text {
-  opacity: 1;
-  font-weight: 600;
-  background: var(--surface-base-hover, rgba(127,127,127,.14));
+.sr-num, .sr-time {
+  opacity: .55;
+  margin-right: 6px;
+  font-variant-numeric: tabular-nums;
 }
+.sr-turn:hover { background: var(--surface-base-hover, rgba(127,127,127,.14)); }
+.sr-rail[data-open="true"] .sr-turn:hover .sr-text,
+.sr-rail[data-open="true"] .sr-turn[data-active="true"] .sr-text { opacity: 1; }
+.sr-turn[data-active="true"] { font-weight: 500; }
 /* brief highlight of the row a jump landed on */
 .sr-flash-target { animation: srPulse 1.5s ease-out 1; }
 @keyframes srPulse {
@@ -735,24 +773,27 @@ function Rail(props) {
             ×
           </button>
         </div>
-        <Show when={turns().length > 0} fallback={<div class="sr-note">{note() || `… ${VERSION}`}</div>}>
-          <For each={turns()}>
-            {(turn, index) => (
-              <button
-                type="button"
-                class="sr-turn"
-                data-active={active() === turn.id ? "true" : "false"}
-                onClick={() => void jump(turn)}
-              >
-                <span class="sr-text">
-                  <span class="sr-num">#{index() + 1}</span>
-                  {formatTime(turn.created)} {turn.text}
-                </span>
-                <span class="sr-dash" />
-              </button>
-            )}
-          </For>
-        </Show>
+        <div class="sr-list">
+          <Show when={turns().length > 0} fallback={<div class="sr-note">{note() || `… ${VERSION}`}</div>}>
+            <For each={turns()}>
+              {(turn, index) => (
+                <button
+                  type="button"
+                  class="sr-turn"
+                  data-active={active() === turn.id ? "true" : "false"}
+                  onClick={() => void jump(turn)}
+                >
+                  <span class="sr-text">
+                    <span class="sr-num">#{index() + 1}</span>
+                    <span class="sr-time">{formatTime(turn.created)}</span>
+                    {turn.text}
+                  </span>
+                  <span class="sr-dash" />
+                </button>
+              )}
+            </For>
+          </Show>
+        </div>
       </div>
     </>
   )
