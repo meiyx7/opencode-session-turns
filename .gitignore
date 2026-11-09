@@ -1,0 +1,5 @@
+node_modules/
+dist/
+gui-experimental.cjs
+*.log
+.DS_Store
