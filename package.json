@@ -1,7 +1,7 @@
 {
   "name": "opencode-session-turns",
-  "version": "0.1.0",
-  "description": "OpenCode Desktop plugin: a right-edge rail listing every user turn of the current session; click a turn to jump to that message.",
+  "version": "0.1.1",
+  "description": "OpenCode Desktop 插件：在会话右缘列出每一轮用户提问，点击即可跳转到对应消息。A right-edge rail of user turns; click one to jump to that message.",
   "type": "module",
   "license": "MIT",
   "author": "meiyx7",
