@@ -253,7 +253,10 @@ const CSS = `
   flex-shrink: 0;
 }
 .sr-close:hover { opacity: 1; background: var(--surface-base-hover, rgba(127,127,127,.14)); }
-/* the scrollable list; the header stays fixed above it */
+/* the scrollable list; the header stays fixed above it.
+   The collapsed rail must NOT be a scroll container: centering the content
+   inside a scroller overflows in both directions, so the browser clamps the
+   scroll offset and the list snaps to the top/bottom when the panel opens. */
 .sr-list {
   flex: 1;
   min-height: 0;
@@ -261,11 +264,15 @@ const CSS = `
   flex-direction: column;
   justify-content: center;
   gap: 2px;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden;
   scrollbar-width: none;
 }
-.sr-rail[data-open="true"] .sr-list { justify-content: flex-start; gap: 1px; scrollbar-width: thin; }
+.sr-rail[data-open="true"] .sr-list {
+  justify-content: flex-start;
+  gap: 1px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
 .sr-list::-webkit-scrollbar { display: none; }
 .sr-rail[data-open="true"] .sr-list::-webkit-scrollbar { display: block; width: 8px; }
 .sr-list::-webkit-scrollbar-track { background: transparent; }
@@ -287,9 +294,6 @@ const CSS = `
   color: inherit;
   font: inherit;
   border-radius: 4px;
-  /* long sessions: skip layout/paint for rows outside the panel viewport */
-  content-visibility: auto;
-  contain-intrinsic-size: 0 26px;
 }
 /* expanded: dash flips to a left-side indicator, content reads left-to-right */
 .sr-rail[data-open="true"] .sr-turn {
@@ -385,6 +389,17 @@ const CSS = `
     box-shadow: inset 0 0 0 2px rgba(255,170,60,0), inset 0 0 0 rgba(255,170,60,0);
   }
 }
+.sr-badge {
+  font-size: 10px;
+  line-height: 1.4;
+  padding: 0 5px;
+  border-radius: 4px;
+  color: rgba(255,170,60,.95);
+  background: rgba(255,170,60,.14);
+  border: 1px solid rgba(255,170,60,.35);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
 .sr-note {
   display: none;
   font-size: 11px;
@@ -392,20 +407,33 @@ const CSS = `
   padding: 2px;
 }
 .sr-rail[data-open="true"] .sr-note { display: block; }
+.sr-foot {
+  flex-shrink: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: rgba(255,170,60,.92);
+  padding: 6px 2px 0;
+  margin-top: 6px;
+  border-top: 1px solid rgba(127,127,127,.2);
+  white-space: pre-wrap;
+  max-height: 64px;
+  overflow: hidden;
+}
 .sr-status {
   position: fixed;
-  right: 30px;
-  bottom: 150px;
+  right: 42px;
+  top: 50%;
+  transform: translateY(-50%);
   z-index: 401;
   font-size: 11px;
-  padding: 3px 8px;
+  line-height: 1.5;
+  padding: 4px 9px;
   border-radius: 6px;
-  background: var(--background-strong, rgba(0,0,0,.75));
+  background: var(--background-strong, rgba(0,0,0,.82));
   color: var(--text-base, #fff);
-  opacity: .9;
-  pointer-events: none;
+  border: 1px solid rgba(127,127,127,.25);
   white-space: pre-wrap;
-  max-width: min(720px, 90vw);
+  max-width: 260px;
 }
 `
 
@@ -851,12 +879,9 @@ function Rail(props) {
 
     // Clicking the same turn again while its jump is running must NOT restart
     // the loop: every restart cancels the host's in-flight page load, which is
-    // what makes a deep jump advance only one page per click. Re-affirm the
-    // progress instead and let the running loop finish.
-    if (jumping() && busyID() === turn.id) {
-      flash(`正在跳转 · 已加载 ${jumpPages()} 页 · ${jumpElapsed()}s`, JUMP_TOTAL_MS)
-      return
-    }
+    // what makes a deep jump advance only one page per click. The header
+    // already shows the progress, so just leave it running.
+    if (jumping() && busyID() === turn.id) return
 
     const token = ++jumpToken
     // A new click always owns the progress UI. This also clears a previous
@@ -920,9 +945,8 @@ function Rail(props) {
     setJumpElapsed(0)
     // Pin the panel open even if the pointer has left it meanwhile.
     setOpen(true)
-    // Only say something when the click cannot be served instantly: the target
-    // is not in the DOM yet, so the host has to load history first.
-    flash(warming() ? "正在预热历史，请稍候…" : "正在加载历史…", 5000)
+    // The loading state is shown in the panel header and on the target row -
+    // no toast needed, the toast would land outside the user's focus.
     const startedAt = Date.now()
     const elapsedTimer = setInterval(() => {
       setJumpElapsed(Math.round((Date.now() - startedAt) / 1000))
@@ -1120,7 +1144,7 @@ function Rail(props) {
             }
           >
             <span class="sr-title sr-progress">
-              跳转中{jumpPages() > 0 ? ` · 已加载 ${jumpPages()} 页` : ""}
+              加载历史中{jumpPages() > 0 ? ` · ${jumpPages()} 页` : ""}
               {jumpElapsed() > 0 ? ` · ${jumpElapsed()}s` : ""}
             </span>
           </Show>
@@ -1152,13 +1176,25 @@ function Rail(props) {
                     <span class="sr-time">{formatTime(turn.created)}</span>
                     {turn.text}
                   </span>
+                  <Show when={jumping() && busyID() === turn.id}>
+                    <span class="sr-badge">加载中</span>
+                  </Show>
                   <span class="sr-dash" />
                 </button>
               )}
             </For>
           </Show>
         </div>
+        {/* Messages that need attention (errors, cancel confirmations) live in
+            the panel footer while it is open, and next to the collapsed rail
+            when it is closed - the old bottom-right toast was easy to miss. */}
+        <Show when={open() && status()}>
+          <div class="sr-foot">{status()}</div>
+        </Show>
       </div>
+      <Show when={!open() && status()}>
+        <div class="sr-status">{status()}</div>
+      </Show>
     </>
   )
 
