@@ -1,15 +1,16 @@
 import { Command, Plugin, Slot, Style, usePlugin } from "@opencode/plugin/gui"
-import { For, Show, createEffect, createSignal, onCleanup, onMount, untrack } from "solid-js"
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, untrack } from "solid-js"
 import { Portal } from "solid-js/web"
 
 // ---------------------------------------------------------------------------
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v20"
+const VERSION = "v21"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
+const PIN_EVENT = "session-turns:pin"
 
 // paging: a full load walks every page; a light refresh pulls just the newest
 // page (new messages always land at the head of a desc listing).
@@ -53,7 +54,21 @@ const pad = (value) => String(value).padStart(2, "0")
 
 const formatTime = (created) => {
   const date = new Date(created ?? 0)
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  const now = new Date()
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate()
+  if (sameDay) return `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  const yesterday = new Date(now)
+  yesterday.setDate(now.getDate() - 1)
+  const wasYesterday =
+    date.getFullYear() === yesterday.getFullYear() &&
+    date.getMonth() === yesterday.getMonth() &&
+    date.getDate() === yesterday.getDate()
+  if (wasYesterday) return `昨天 ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  // Older turns need a date: a bare HH:mm is ambiguous in multi-day sessions.
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -239,6 +254,73 @@ const CSS = `
   color: rgba(255,170,60,.95);
   font-variant-numeric: tabular-nums;
 }
+.sr-head-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+.sr-iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 4px;
+  opacity: .5;
+}
+.sr-iconbtn svg { width: 13px; height: 13px; }
+.sr-iconbtn:hover { opacity: 1; background: var(--surface-base-hover, rgba(127,127,127,.14)); }
+.sr-iconbtn[data-on="true"] { opacity: .95; color: rgba(255,170,60,.95); }
+.sr-iconbtn:focus-visible { outline: 1px solid currentColor; outline-offset: -1px; }
+/* search box */
+.sr-search {
+  position: relative;
+  flex-shrink: 0;
+  margin: 0 0 6px;
+}
+.sr-search-input {
+  width: 100%;
+  box-sizing: border-box;
+  height: 26px;
+  padding: 0 24px 0 8px;
+  border: 1px solid rgba(127,127,127,.25);
+  border-radius: 6px;
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+  transition: border-color .12s ease, box-shadow .12s ease;
+}
+.sr-search-input::placeholder { color: currentColor; opacity: .4; }
+.sr-search-input:focus {
+  border-color: rgba(255,170,60,.6);
+  box-shadow: 0 0 0 2px rgba(255,170,60,.14);
+}
+.sr-search-clear {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: .5;
+}
+.sr-search-clear:hover { opacity: 1; background: var(--surface-base-hover, rgba(127,127,127,.14)); }
+/* keyboard cursor (↑/↓) */
+.sr-turn[data-cursor="true"] { background: var(--surface-base-hover, rgba(127,127,127,.14)); }
 .sr-close {
   border: 0;
   background: transparent;
@@ -435,6 +517,12 @@ const CSS = `
   white-space: pre-wrap;
   max-width: 260px;
 }
+/* Reduced motion: keep the signals (colors, widths) but drop the animation. */
+@media (prefers-reduced-motion: reduce) {
+  .sr-rail, .sr-dash, .sr-text { transition: none !important; }
+  .sr-turn[data-busy="true"] .sr-dash { animation: none !important; opacity: 1 !important; }
+  .sr-flash-ring { animation: none !important; box-shadow: inset 0 0 0 2px rgba(255,170,60,.5) !important; }
+}
 `
 
 // ---------------------------------------------------------------------------
@@ -448,6 +536,10 @@ function Rail(props) {
   const [open, setOpen] = createSignal(false)
   const [note, setNote] = createSignal("")
   const [status, setStatus] = createSignal("")
+  // Search box over the turn list; empty means show everything.
+  const [query, setQuery] = createSignal("")
+  // Pinned panels stay open when the pointer leaves (toggle: ⌘⌥P / /turns pin).
+  const [pinned, setPinned] = createSignal(false)
   // Jump progress. While `jumping` is true the panel stays pinned open and the
   // header reports what the host is doing; `busyID` marks the target row.
   const [jumping, setJumping] = createSignal(false)
@@ -662,14 +754,45 @@ function Rail(props) {
 
   // ---- active-turn tracking ----------------------------------------------
   // Driven by scroll events (captured at document level so it also sees the
-  // real scroller without querying first) plus one rAF-throttled pass, with a
-  // slow interval as a fallback for rows mounting without a scroll (history
-  // paging, virtual list swaps).
+  // real scroller without querying first) plus one rAF-throttled pass. An
+  // IntersectionObserver on the timeline rows replaces the old 1.5s interval:
+  // a row leaving the sentinel line at the top of the viewport means the turn
+  // under it became active, with zero work when nothing moves (and none at
+  // all in a background window, where rAF is throttled to zero).
   let scrollerCache
   const scroller = () => {
     if (scrollerCache?.isConnected) return scrollerCache
     scrollerCache = findScroller()
     return scrollerCache
+  }
+
+  // Rows already wired to the observer, keyed by element so history paging
+  // (rows mounting/unmounting) never re-observes the same node.
+  const observed = new WeakSet()
+  let rowObserver
+  const ensureObserver = () => {
+    if (rowObserver) return rowObserver
+    rowObserver = new IntersectionObserver(
+      (entries) => {
+        // Any intersection change along the sentinel line can shift which turn
+        // is topmost; recompute from the DOM (rAF-throttled, cheap).
+        if (entries.length === 0) return
+        scheduleTrack()
+      },
+      { rootMargin: "-40px 0px 0px 0px", threshold: 0 },
+    )
+    return rowObserver
+  }
+  // Wire up rows that appeared since the last pass. Called from trackActive,
+  // so it only runs while the document is actually scrolling (rAF-gated).
+  const observeRows = () => {
+    const observer = ensureObserver()
+    for (const row of document.querySelectorAll("[data-message-id]")) {
+      if (!observed.has(row)) {
+        observed.add(row)
+        observer.observe(row)
+      }
+    }
   }
 
   const trackActive = () => {
@@ -681,7 +804,7 @@ function Rail(props) {
     for (const row of rows) {
       if (row.getBoundingClientRect().bottom >= top) {
         const id = row.getAttribute("data-message-id")
-        if (id) setActive(id)
+        if (id && id !== active()) setActive(id)
         break
       }
     }
@@ -694,16 +817,25 @@ function Rail(props) {
     requestAnimationFrame(() => {
       rafPending = false
       trackActive()
+      observeRows()
     })
   }
 
   onMount(() => {
     const onScroll = () => scheduleTrack()
     document.addEventListener("scroll", onScroll, true)
-    const fallback = setInterval(scheduleTrack, 1500)
+    // One slow liveness pass only while the tab is visible: catches rows that
+    // mount without a scroll event and reconnects after DOM swaps, without
+    // burning cycles in background windows (rAF never fires there, and the
+    // interval self-pauses via document.hidden).
+    const fallback = setInterval(() => {
+      if (document.hidden) return
+      scheduleTrack()
+    }, 4000)
     onCleanup(() => {
       document.removeEventListener("scroll", onScroll, true)
       clearInterval(fallback)
+      rowObserver?.disconnect()
     })
   })
 
@@ -731,7 +863,12 @@ function Rail(props) {
         return
       }
       if (untrack(open)) {
-        setOpen(false)
+        // Unpin first when pinned; a second Esc then closes the panel.
+        if (untrack(pinned)) {
+          setPinned(false)
+        } else {
+          setOpen(false)
+        }
         // Only swallow Esc while the rail is actually open, so the host keeps
         // its own Escape handling the rest of the time.
         event.stopPropagation()
@@ -739,6 +876,7 @@ function Rail(props) {
     }
     const onPointerDown = (event) => {
       if (!untrack(open)) return
+      if (untrack(pinned)) return
       const path = event.composedPath?.() ?? []
       const inside = path.some((node) => node instanceof Element && node.closest?.(".sr-rail"))
       if (!inside) setOpen(false)
@@ -753,17 +891,27 @@ function Rail(props) {
 
   onMount(() => {
     const onDiag = () => flash(`${VERSION} · ${diagnostics(ctx)}`)
-    // /turns toggles the panel; Esc / outside click / × also close it. No more
-    // forced auto-close after 4s.
+    // /turns toggles the panel; ⌘⌥P / the pin button toggles "pinned" (stay
+    // open when the pointer leaves). Esc / outside click / × still close an
+    // unpinned panel.
     const onOpen = () => {
       setOpen((value) => !value)
       maybePrewarm()
     }
+    const onPin = () => {
+      setPinned((value) => !value)
+      if (!untrack(open)) {
+        setOpen(true)
+        maybePrewarm()
+      }
+    }
     window.addEventListener(DIAG_EVENT, onDiag)
     window.addEventListener(OPEN_EVENT, onOpen)
+    window.addEventListener(PIN_EVENT, onPin)
     onCleanup(() => {
       window.removeEventListener(DIAG_EVENT, onDiag)
       window.removeEventListener(OPEN_EVENT, onOpen)
+      window.removeEventListener(PIN_EVENT, onPin)
     })
     // No startup toast: the plugin should be invisible when everything works.
   })
@@ -1201,8 +1349,64 @@ function Rail(props) {
     onCleanup(() => clearTimeout(timer))
   })
 
-  // Keep the busy row visible in the panel list while the jump pages through
-  // history, so the "which turn am I waiting for" answer stays on screen.
+  // ---- search / keyboard navigation --------------------------------------
+  // Filtered view of the turns; identity-stable so <For> keeps DOM nodes.
+  const visibleTurns = createMemo(() => {
+    const list = turns()
+    const needle = query().trim().toLowerCase()
+    if (!needle) return list
+    return list.filter((turn) => turn.text.toLowerCase().includes(needle))
+  })
+
+  // The row the ↑/↓ keys currently point at (index within visibleTurns).
+  const [cursorIndex, setCursorIndex] = createSignal(-1)
+  const clearCursor = () => setCursorIndex(-1)
+
+  const moveCursor = (delta) => {
+    const list = visibleTurns()
+    if (list.length === 0) return
+    let index = cursorIndex()
+    if (index < 0) {
+      // Start from the active turn when the cursor is fresh, so ↓ walks to the
+      // next turn relative to where the viewport already is.
+      const activeID = active()
+      index = list.findIndex((turn) => turn.id === activeID)
+      if (index < 0) index = delta > 0 ? -1 : 0
+    }
+    index = Math.min(list.length - 1, Math.max(0, index + delta))
+    setCursorIndex(index)
+    requestAnimationFrame(() => {
+      document
+        .querySelector(`.sr-list .sr-turn[data-index="${index}"]`)
+        ?.scrollIntoView({ block: "nearest" })
+    })
+  }
+
+  const activateCursor = () => {
+    const turn = visibleTurns()[cursorIndex()]
+    if (!turn) return
+    void jump(turn)
+  }
+
+  // The search input, for focus round-trips.
+  let searchInput: HTMLInputElement | undefined
+  const listKeyDown = (event) => {
+    if (event.key === "ArrowDown") {
+      event.preventDefault()
+      event.stopPropagation()
+      moveCursor(1)
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault()
+      event.stopPropagation()
+      moveCursor(-1)
+    } else if (event.key === "Enter" && cursorIndex() >= 0) {
+      event.preventDefault()
+      event.stopPropagation()
+      activateCursor()
+    }
+  }
+
+  // Keep the highlighted row visible while a jump pages through history.
   createEffect(() => {
     if (!jumping()) return
     if (!busyID()) return
@@ -1224,22 +1428,30 @@ function Rail(props) {
         class="sr-rail"
         data-open={open() ? "true" : "false"}
         data-jumping={jumping() ? "true" : "false"}
+        data-pinned={pinned() ? "true" : "false"}
+        role={open() ? "dialog" : undefined}
+        aria-label={open() ? "会话轮次" : undefined}
         onMouseEnter={() => {
           setOpen(true)
           maybePrewarm()
         }}
-        // Keep the panel pinned while a long history jump runs; otherwise the
-        // mouse drifting off the rail hides exactly the progress the user is
-        // waiting for. Esc / × still close (or cancel) it.
+        // Keep the panel pinned while a long history jump runs or when the
+        // user pinned it; otherwise the mouse drifting off the rail hides
+        // exactly the progress the user is waiting for. Esc / × still close
+        // (or cancel) it.
         onMouseLeave={() => {
-          if (!jumping()) setOpen(false)
+          if (!jumping() && !pinned()) setOpen(false)
         }}
       >
         <div class="sr-head">
           <Show
             when={jumping()}
             fallback={
-              <span class="sr-title">会话轮次{turns().length > 0 ? ` · ${turns().length}` : ""}</span>
+              <span class="sr-title">
+                会话轮次
+                {turns().length > 0 ? ` · ${turns().length}` : ""}
+                <Show when={query().trim()}> · 匹配 {visibleTurns().length}</Show>
+              </span>
             }
           >
             <span class="sr-title sr-progress">
@@ -1248,31 +1460,93 @@ function Rail(props) {
               {jumpElapsed() > 0 ? ` · ${jumpElapsed()}s` : ""}
             </span>
           </Show>
-          <button
-            type="button"
-            class="sr-close"
-            title={jumping() ? "取消跳转 (Esc)" : "关闭 (Esc)"}
-            onClick={() => {
-              if (jumping()) cancelJump()
-              else setOpen(false)
-            }}
-          >
-            ×
-          </button>
+          <span class="sr-head-actions">
+            <button
+              type="button"
+              class="sr-iconbtn"
+              data-on={pinned() ? "true" : "false"}
+              title={pinned() ? "取消固定 (⌘⌥P)" : "固定面板 (⌘⌥P)"}
+              aria-label={pinned() ? "取消固定面板" : "固定面板"}
+              aria-pressed={pinned() ? "true" : "false"}
+              onClick={() => setPinned(!pinned())}
+            >
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <Show
+                  when={pinned()}
+                  fallback={
+                    <>
+                      <path d="M9.5 2.5l4 4-2.6.9-1.4 3.5-4.4-4.4L8.6 5.1z" />
+                      <path d="M5.1 6.5L2.5 9.1l4.4 4.4 2.6-2.6" />
+                    </>
+                  }
+                >
+                  <path d="M6 3l7 7-3.5.5L7 13 3 9l2.5-2.5z" />
+                  <path d="M4 12l-1.5 1.5" />
+                </Show>
+              </svg>
+            </button>
+            <button
+              type="button"
+              class="sr-close"
+              title={jumping() ? "取消跳转 (Esc)" : "关闭 (Esc)"}
+              onClick={() => {
+                if (jumping()) cancelJump()
+                else setOpen(false)
+              }}
+            >
+              ×
+            </button>
+          </span>
         </div>
-        <div class="sr-list">
-          <Show when={turns().length > 0} fallback={<div class="sr-note">{note() || `… ${VERSION}`}</div>}>
-            <For each={turns()}>
+        <Show when={turns().length >= 8}>
+          <div class="sr-search">
+            <input
+              ref={searchInput}
+              type="text"
+              class="sr-search-input"
+              placeholder="搜索轮次…"
+              value={query()}
+              onInput={(event) => {
+                setQuery(event.currentTarget.value)
+                clearCursor()
+              }}
+              onKeyDown={listKeyDown}
+            />
+            <Show when={query()}>
+              <button
+                type="button"
+                class="sr-search-clear"
+                aria-label="清除搜索"
+                onClick={() => {
+                  setQuery("")
+                  clearCursor()
+                  searchInput?.focus()
+                }}
+              >
+                ×
+              </button>
+            </Show>
+          </div>
+        </Show>
+        <div
+          class="sr-list"
+          onKeyDown={listKeyDown}
+          tabIndex={-1}
+        >
+          <Show when={visibleTurns().length > 0} fallback={<div class="sr-note">{note() || `… ${VERSION}`}</div>}>
+            <For each={visibleTurns()}>
               {(turn, index) => (
                 <button
                   type="button"
                   class="sr-turn"
                   data-active={active() === turn.id ? "true" : "false"}
+                  data-cursor={cursorIndex() === index() ? "true" : "false"}
                   data-busy={jumping() && busyID() === turn.id ? "true" : "false"}
+                  data-index={index()}
                   onClick={() => void jump(turn)}
                 >
                   <span class="sr-text">
-                    <span class="sr-num">#{index() + 1}</span>
+                    <span class="sr-num">#{turns().indexOf(turn) + 1}</span>
                     <span class="sr-time">{formatTime(turn.created)}</span>
                     {turn.text}
                   </span>
@@ -1312,6 +1586,8 @@ export default Plugin.define({
     en: {
       "command.jump": "Session turns: show / jump",
       "command.jump.description": "Reveal the turn rail; click a turn to jump to that message",
+      "command.pin": "Session turns: pin panel",
+      "command.pin.description": "Toggle pinning the turn rail open (⌘⌥P)",
     },
   },
   setup(ctx) {
@@ -1333,12 +1609,23 @@ export default Plugin.define({
       id: "jump",
       title: ctx.t("command.jump"),
       description: ctx.t("command.jump.description"),
-      group: ctx.t("command.jump"),
       section: "navigation",
       bind: "mod+alt+r",
       slash: { name: "turns" },
       run: () => {
         window.dispatchEvent(new Event(OPEN_EVENT))
+      },
+    }))
+
+    ctx.add(Command, () => ({
+      id: "pin",
+      title: ctx.t("command.pin"),
+      description: ctx.t("command.pin.description"),
+      section: "navigation",
+      bind: "mod+alt+p",
+      slash: { name: "turns-pin" },
+      run: () => {
+        window.dispatchEvent(new Event(PIN_EVENT))
       },
     }))
   },
