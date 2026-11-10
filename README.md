@@ -1,10 +1,13 @@
-# opencode-session-turns
+# opencode-timeline-gui
 
 **OpenCode Desktop 插件：在会话右缘列出每一轮的「用户提问」，悬停展开，点击即刻跳转到那一条消息。**
 
 An OpenCode Desktop plugin that adds a slim rail on the right edge of the
 conversation, listing every user turn of the current session. Hover to expand;
 click a turn to jump straight to that message.
+
+> 本包原名 `opencode-session-turns`，自 0.2.0 起更名为 `opencode-timeline-gui`。
+> 已安装旧包的话，把配置里的包名换成新名字即可，功能不变。
 
 适用 OpenCode Desktop 2.2.6（以预构建的 `./gui-experimental` 包形式加载）。
 
@@ -43,7 +46,7 @@ click a turn to jump straight to that message.
 
 ```json
 {
-  "plugins": ["opencode-session-turns"]
+  "plugins": ["opencode-timeline-gui"]
 }
 ```
 
