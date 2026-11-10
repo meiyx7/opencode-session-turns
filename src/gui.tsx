@@ -745,11 +745,11 @@ function Rail(props) {
       }
       const check = (full) => {
         if (token !== jumpToken) return finish(null)
-        const row = findRow(messageID)
+        // Observer callbacks use the cheap id lookup; only the poll pays for the
+        // data-attribute fallback (a full scan) and the row fingerprint.
+        const row = full ? findRow(messageID) : document.getElementById(`${HASH_PREFIX}${messageID}`)
         if (row) return finish(row)
         // Let the click settle before trusting a DOM change as "a page arrived".
-        // Only the poll evaluates the row fingerprint: streaming output fires
-        // the observer constantly and a full query on every mutation is wasted.
         if (full && Date.now() - started > JUMP_SETTLE_MS && rowSignature() !== baseline) finish(null)
       }
       const existing = findRow(messageID)
@@ -839,12 +839,12 @@ function Rail(props) {
             await sleep(120)
           }
         }
-        if (token !== jumpToken) return
+        if (token !== jumpToken || sessionID() !== sessionAtJump) return
         navTo(path, turn.id)
 
         const remaining = Math.min(JUMP_ROW_TIMEOUT_MS, deadline - Date.now())
         const landed = await waitForRow(turn.id, token, remaining)
-        if (token !== jumpToken) return
+        if (token !== jumpToken || sessionID() !== sessionAtJump) return
         if (landed) {
           const live = scroller() ?? sc
           if (live) scrollToRow(live, landed)
