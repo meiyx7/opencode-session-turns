@@ -1,6 +1,6 @@
 {
   "name": "opencode-session-turns",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "OpenCode Desktop 插件：在会话右缘列出每一轮用户提问，点击即可跳转到对应消息。A right-edge rail of user turns; click one to jump to that message.",
   "type": "module",
   "license": "MIT",
