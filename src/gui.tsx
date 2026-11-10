@@ -10,7 +10,6 @@ const VERSION = "v16"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
-const WARM_EVENT = "session-turns:warm"
 
 // paging: a full load walks every page; a light refresh pulls just the newest
 // page (new messages always land at the head of a desc listing).
@@ -27,9 +26,9 @@ const LIGHT_PAGE_SIZE = 50
 // assumes the chain died and starts a new one.
 const JUMP_ROUNDS = 30
 const JUMP_TOTAL_MS = 45000
-const JUMP_CHAIN_MS = 12000
-const JUMP_IDLE_MS = 5000
-const JUMP_FIRST_IDLE_MS = 9000
+const JUMP_CHAIN_MS = 20000
+const JUMP_IDLE_MS = 8000
+const JUMP_FIRST_IDLE_MS = 12000
 const JUMP_TOGGLE_DWELL_MS = 220
 const SAME_TARGET_WINDOW_MS = 800
 
@@ -77,11 +76,21 @@ const findScroller = () =>
 
 // The app sets id="message-<id>" on every timeline row. Prefer that over the
 // data attribute: Solid Router's own scrollToHash() uses getElementById too.
-const findRow = (messageID) =>
-  document.getElementById(`${HASH_PREFIX}${messageID}`) ??
-  [...document.querySelectorAll("[data-message-id]")].find(
-    (node) => node.getAttribute("data-message-id") === messageID,
-  )
+//
+// IMPORTANT: `data-message-id` is set on assistant rows as well (they carry
+// the id of the user message they belong to), so a naive lookup can return an
+// assistant row and we would scroll to the reply instead of the question.
+// Only the user message row counts as "found".
+const findRow = (messageID) => {
+  const anchored = document.getElementById(`${HASH_PREFIX}${messageID}`)
+  if (anchored) return anchored
+  const selector = `[data-message-id="${messageID.replace(/"/g, '\\"')}"]`
+  for (const node of document.querySelectorAll(selector)) {
+    if (node.getAttribute("data-timeline-row") === "UserMessage") return node
+    if (node.querySelector('[data-slot="user-message-text"]')) return node
+  }
+  return undefined
+}
 
 const diagnostics = (ctx) => {
   const scroller = findScroller()
@@ -244,20 +253,6 @@ const CSS = `
   flex-shrink: 0;
 }
 .sr-close:hover { opacity: 1; background: var(--surface-base-hover, rgba(127,127,127,.14)); }
-.sr-warm {
-  border: 1px solid rgba(127,127,127,.28);
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  font-size: 11px;
-  line-height: 1;
-  padding: 3px 7px;
-  border-radius: 5px;
-  cursor: pointer;
-  opacity: .6;
-  flex-shrink: 0;
-}
-.sr-warm:hover { opacity: 1; background: var(--surface-base-hover, rgba(127,127,127,.14)); }
 /* the scrollable list; the header stays fixed above it */
 .sr-list {
   flex: 1;
@@ -722,17 +717,13 @@ function Rail(props) {
       setOpen((value) => !value)
       maybePrewarm()
     }
-    const onWarm = () => void prewarm()
     window.addEventListener(DIAG_EVENT, onDiag)
     window.addEventListener(OPEN_EVENT, onOpen)
-    window.addEventListener(WARM_EVENT, onWarm)
     onCleanup(() => {
       window.removeEventListener(DIAG_EVENT, onDiag)
       window.removeEventListener(OPEN_EVENT, onOpen)
-      window.removeEventListener(WARM_EVENT, onWarm)
     })
-    // One-shot confirmation that this window actually runs the rebuilt bundle.
-    flash(`会话轮次 ${VERSION} 已加载`)
+    // No startup toast: the plugin should be invisible when everything works.
   })
 
   // ---- jump ----------------------------------------------------------------
@@ -896,11 +887,11 @@ function Rail(props) {
     const sc = scroller()
     const row = findRow(turn.id)
 
-    // Fast path: the row is mounted, scroll locally.
+    // Fast path: the row is mounted, scroll locally. No toast: the bubble
+    // ring is the feedback.
     if (row && sc) {
       alignAfterLand(row)
       pulse(row)
-      flash("已定位")
       return
     }
 
@@ -929,7 +920,9 @@ function Rail(props) {
     setJumpElapsed(0)
     // Pin the panel open even if the pointer has left it meanwhile.
     setOpen(true)
-    flash("正在定位…", JUMP_TOTAL_MS)
+    // Only say something when the click cannot be served instantly: the target
+    // is not in the DOM yet, so the host has to load history first.
+    flash(warming() ? "正在预热历史，请稍候…" : "正在加载历史…", 5000)
     const startedAt = Date.now()
     const elapsedTimer = setInterval(() => {
       setJumpElapsed(Math.round((Date.now() - startedAt) / 1000))
@@ -959,21 +952,19 @@ function Rail(props) {
         }
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         navTo(path, turn.id)
-        flash(`跳转中 · 已加载 ${chainBase} 页`, JUMP_TOTAL_MS)
 
         let chainPages = 0
         const remaining = Math.min(JUMP_CHAIN_MS, deadline - Date.now())
         const landed = await waitForRow(turn.id, token, remaining, (pages) => {
           chainPages = pages
+          // Progress is shown in the panel header, not in a toast.
           setJumpPages(chainBase + pages)
-          flash(`跳转中 · 已加载 ${chainBase + pages} 页`, JUMP_TOTAL_MS)
         })
         chainBase += chainPages
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         if (landed) {
           alignAfterLand(landed)
           pulse(landed)
-          flash("已定位")
           return
         }
         // The host went idle without landing: it exhausted this chain. The
@@ -1002,7 +993,6 @@ function Rail(props) {
   // and restore the viewport afterwards. Once the store holds the whole
   // history every jump is instant.
   const [warming, setWarming] = createSignal(false)
-  const [warmPages, setWarmPages] = createSignal(0)
   let warmToken = 0
   let warmedFor = ""
 
@@ -1014,9 +1004,9 @@ function Rail(props) {
     for (const row of sc.querySelectorAll("[data-message-id]")) {
       const rect = row.getBoundingClientRect()
       if (rect.bottom <= scRect.top + 1) continue
-      const id = row.getAttribute("data-message-id")
-      if (!id) continue
-      return { id, offset: rect.top - scRect.top }
+      const mid = row.getAttribute("data-message-id")
+      if (!mid) continue
+      return { el: row, id: mid, offset: rect.top - scRect.top }
     }
     return undefined
   }
@@ -1025,7 +1015,9 @@ function Rail(props) {
     if (!anchor) return
     const sc = scroller()
     if (!sc) return
-    const row = findRow(anchor.id)
+    // Prefer the element itself: an assistant row can carry the same message
+    // id, so looking it up by id might land on a different element.
+    const row = anchor.el?.isConnected ? anchor.el : findRow(anchor.id)
     if (!row) return
     const scRect = sc.getBoundingClientRect()
     const delta = row.getBoundingClientRect().top - scRect.top - anchor.offset
@@ -1054,33 +1046,20 @@ function Rail(props) {
     const sid = sessionID()
     if (!path || !oldest || !sid) return
     // Already warm: the oldest turn is mounted, so the store has the history.
-    if (warmedFor === sid && findRow(oldest.id)) {
-      flash("历史已就绪")
-      return
-    }
+    if (warmedFor === sid && findRow(oldest.id)) return
     const token = ++warmToken
     const anchor = viewAnchor()
     const sc = scroller()
     const wasAtBottom = sc ? sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 32 : true
     setWarming(true)
-    setWarmPages(0)
-    flash("正在预热历史…", 120000)
     try {
       navTo(path, oldest.id)
       const deadline = Date.now() + 120000
-      let pages = 0
-      let lastSig = rowSignature()
       const keep = setInterval(() => restoreView(anchor), 150)
       try {
         while (Date.now() < deadline && token === warmToken) {
           if (findRow(oldest.id)) break
           await sleep(250)
-          const sig = rowSignature()
-          if (sig !== lastSig) {
-            lastSig = sig
-            pages++
-            setWarmPages(pages)
-          }
         }
       } finally {
         clearInterval(keep)
@@ -1093,7 +1072,7 @@ function Rail(props) {
         if (live) live.scrollTop = live.scrollHeight
       }
       warmedFor = sid
-      flash(`历史已预热（${pages} 页），现在跳转是瞬时的`)
+      // Silent on success: prewarming is an implementation detail.
     } finally {
       if (token === warmToken) setWarming(false)
     }
@@ -1135,25 +1114,16 @@ function Rail(props) {
       >
         <div class="sr-head">
           <Show
-            when={jumping() || warming()}
+            when={jumping()}
             fallback={
               <span class="sr-title">会话轮次{turns().length > 0 ? ` · ${turns().length}` : ""}</span>
             }
           >
             <span class="sr-title sr-progress">
-              {jumping()
-                ? `跳转中${jumpPages() > 0 ? ` · 已加载 ${jumpPages()} 页` : ""}${jumpElapsed() > 0 ? ` · ${jumpElapsed()}s` : ""}`
-                : `预热中${warmPages() > 0 ? ` · ${warmPages()} 页` : ""}`}
+              跳转中{jumpPages() > 0 ? ` · 已加载 ${jumpPages()} 页` : ""}
+              {jumpElapsed() > 0 ? ` · ${jumpElapsed()}s` : ""}
             </span>
           </Show>
-          <button
-            type="button"
-            class="sr-warm"
-            title="预热历史：后台把会话历史加载完，之后跳转瞬时"
-            onClick={() => window.dispatchEvent(new Event(WARM_EVENT))}
-          >
-            预热
-          </button>
           <button
             type="button"
             class="sr-close"
