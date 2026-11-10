@@ -770,6 +770,12 @@ function Rail(props) {
 
   const jump = async (turn) => {
     const token = ++jumpToken
+    // A new click always owns the progress UI. This also clears a previous
+    // jump's state when the new target takes the mounted fast path, where the
+    // superseded loop's finally no longer touches these signals.
+    setJumping(false)
+    setJumpPage(0)
+    setBusyID("")
     lastJumpID = turn.id
     const now = Date.now()
 
@@ -810,6 +816,7 @@ function Rail(props) {
     // another seek/page. A round ends as soon as rows appear instead of always
     // sleeping 6s. A newer click bumps jumpToken, which cancels this loop at
     // every await; Esc cancels it too.
+    const sessionAtJump = sessionID()
     setJumping(true)
     setBusyID(turn.id)
     setJumpPage(0)
@@ -819,7 +826,9 @@ function Rail(props) {
     try {
       const deadline = Date.now() + JUMP_TOTAL_MS
       for (let round = 0; round < JUMP_ROUNDS && Date.now() < deadline; round++) {
-        if (token !== jumpToken) return
+        // Abandon the loop if the user switched sessions mid-jump: toggling the
+        // old route hash would navigate back to the previous session.
+        if (token !== jumpToken || sessionID() !== sessionAtJump) return
         setJumpPage(round + 1)
         flash(`跳转中 · 第 ${round + 1} 页`, JUMP_TOTAL_MS)
 
