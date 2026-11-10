@@ -35,6 +35,7 @@ const SAME_TARGET_WINDOW_MS = 800
 // Filled by Rail.load()/jump() so the command palette can report diagnostics.
 let lastTurnCount = 0
 let lastNote = ""
+let lastAlign = ""
 let lastJumpID = ""
 
 const firstLine = (message) => {
@@ -91,37 +92,50 @@ const diagnostics = (ctx) => {
   try {
     route = ctx.router.path() || "(空)"
   } catch {}
-  return `轮次 ${lastTurnCount} · 容器 ${scroller ? "OK" : "缺失"} · DOM ${nodes.length} 行${target}${id} · 路由 ${route} · hash ${window.location.hash || "(空)"}${lastNote ? ` · ${lastNote}` : ""}`
+  return `轮次 ${lastTurnCount} · 容器 ${scroller ? "OK" : "缺失"} · DOM ${nodes.length} 行${target}${id} · 路由 ${route} · hash ${window.location.hash || "(空)"}${lastAlign ? ` · ${lastAlign}` : ""}${lastNote ? ` · ${lastNote}` : ""}`
 }
 
-const scrollToRow = (scroller, row) => {
-  // Align by rects instead of scrollIntoView: the host puts the row top flush
-  // against the sticky session title, but a 16px gradient fade sits right below
-  // it and would cover the top of the bubble (and our outline). Leave 24px so
-  // the bubble clears both the title and the fade.
-  const title = scroller.querySelector("[data-session-title]")
-  const scRect = scroller.getBoundingClientRect()
-  const titleBottom =
-    title instanceof HTMLElement ? title.getBoundingClientRect().bottom : scRect.top
-  const rowTop = row.getBoundingClientRect().top
-  const delta = rowTop - (titleBottom + 24)
-  if (Math.abs(delta) > 2) scroller.scrollTop += delta
+// The timeline's top is covered by the host's sticky header: the session title
+// (z-30) plus a 16px gradient fade strip that sits right below it. The host
+// parks a sought row flush against that band, which is why the bubble's top
+// edge (and the highlight ring) used to be cut off.
+//
+// Instead of guessing a fixed offset, measure the band: every sticky element
+// pinned to the top of the scrollport contributes its bottom edge.
+const topInset = (scroller) => {
+  const scTop = scroller.getBoundingClientRect().top
+  let bottom = scTop
+  for (const el of scroller.querySelectorAll(".sticky, [data-session-title]")) {
+    if (!(el instanceof HTMLElement)) continue
+    const style = getComputedStyle(el)
+    if (style.position !== "sticky" && !el.hasAttribute("data-session-title")) continue
+    const rect = el.getBoundingClientRect()
+    if (rect.height === 0) continue
+    if (rect.top > scTop + 4) continue // not pinned to the top
+    bottom = Math.max(bottom, rect.bottom)
+  }
+  return bottom
 }
 
-// The host's own hash seek may finish after ours and re-align the row flush
-// under the sticky title (its 16px fade then covers the bubble's top edge).
-// Repair only that case: if the user already scrolled elsewhere, leave it be.
-const repairScroll = (row) => {
-  setTimeout(() => {
-    if (!row.isConnected) return
+// Places the message bubble (not the row) clear of the header band.
+const alignBubble = (row) => {
+  try {
     const sc = findScroller()
-    if (!sc) return
-    const title = sc.querySelector("[data-session-title]")
-    const titleBottom =
-      title instanceof HTMLElement ? title.getBoundingClientRect().bottom : sc.getBoundingClientRect().top
-    const rowTop = row.getBoundingClientRect().top
-    if (rowTop < titleBottom + 4) sc.scrollTop += rowTop - (titleBottom + 24)
-  }, 300)
+    if (!sc || !row.isConnected) return
+    const bubble = row.querySelector('[data-slot="user-message-text"]') ?? row
+    const inset = topInset(sc)
+    const delta = bubble.getBoundingClientRect().top - (inset + 18)
+    if (Math.abs(delta) > 2) sc.scrollTop += delta
+    lastAlign = `inset ${Math.round(inset)} · delta ${Math.round(delta)}`
+  } catch {}
+}
+
+// The host's own seek may finish after ours (it can even scroll smoothly),
+// re-aligning the row flush under the header. Re-align a couple of times.
+const alignAfterLand = (row) => {
+  alignBubble(row)
+  setTimeout(() => alignBubble(row), 450)
+  setTimeout(() => alignBubble(row), 1000)
 }
 
 // The desktop app (2.2.6) routes through a memory history, so window.location is
@@ -263,6 +277,9 @@ const CSS = `
   color: inherit;
   font: inherit;
   border-radius: 4px;
+  /* long sessions: skip layout/paint for rows outside the panel viewport */
+  content-visibility: auto;
+  contain-intrinsic-size: 0 26px;
 }
 /* expanded: dash flips to a left-side indicator, content reads left-to-right */
 .sr-rail[data-open="true"] .sr-turn {
@@ -848,7 +865,7 @@ function Rail(props) {
       const row = findRow(turn.id)
       const sc = scroller()
       if (row && sc) {
-        scrollToRow(sc, row)
+        alignAfterLand(row)
         pulse(row)
         return
       }
@@ -861,7 +878,7 @@ function Rail(props) {
 
     // Fast path: the row is mounted, scroll locally.
     if (row && sc) {
-      scrollToRow(sc, row)
+      alignAfterLand(row)
       pulse(row)
       flash("已定位")
       return
@@ -934,11 +951,9 @@ function Rail(props) {
         chainBase += chainPages
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         if (landed) {
-          const live = scroller() ?? sc
-          if (live) scrollToRow(live, landed)
+          alignAfterLand(landed)
           pulse(landed)
           flash("已定位")
-          repairScroll(landed)
           return
         }
         // The host went idle without landing: it exhausted this chain. The
