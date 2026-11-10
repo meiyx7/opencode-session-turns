@@ -6,7 +6,7 @@ import { Portal } from "solid-js/web"
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v16"
+const VERSION = "v19"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
@@ -455,6 +455,9 @@ function Rail(props) {
   const [jumpElapsed, setJumpElapsed] = createSignal(0)
   const [jumpChain, setJumpChain] = createSignal(0)
   const [busyID, setBusyID] = createSignal("")
+  // True while a click is waiting for the background prewarm to page its target
+  // in (header reads "预热中 · 稍等一下" instead of "加载历史中").
+  const [waitWarm, setWaitWarm] = createSignal(false)
 
   // ---- turn cache ---------------------------------------------------------
   // Object identity is kept stable across refreshes so Solid's <For> reuses
@@ -497,6 +500,9 @@ function Rail(props) {
   const load = async (id, mode) => {
     const token = ++loadToken
     loadingActive = true
+    // A full (re)load means the host store may be cold again (session open or
+    // server rebuild): invalidate the prewarm marker so it runs once more.
+    if (mode === "full") warmedFor = ""
     let error = ""
     try {
       let cursor
@@ -542,6 +548,11 @@ function Rail(props) {
       if (pendingBump) {
         pendingBump = false
         scheduleLight()
+      }
+      // Prewarm long sessions as soon as their full turn list has loaded, so
+      // the history is warm before the first click (not only on rail hover).
+      if (mode === "full" && !error && id === untrack(sessionID) && cache.size >= 15) {
+        setTimeout(() => maybePrewarm(), 800)
       }
     }
   }
@@ -870,36 +881,40 @@ function Rail(props) {
     setJumpElapsed(0)
     setJumpChain(0)
     setBusyID("")
+    setWaitWarm(false)
     flash("已取消跳转")
   }
 
   const jump = async (turn) => {
-    // A jump takes priority over a background prewarm.
-    if (warming()) cancelWarm()
-
     // Clicking the same turn again while its jump is running must NOT restart
     // the loop: every restart cancels the host's in-flight page load, which is
     // what makes a deep jump advance only one page per click. The header
     // already shows the progress, so just leave it running.
     if (jumping() && busyID() === turn.id) return
 
-    const token = ++jumpToken
-    // A new click always owns the progress UI. This also clears a previous
-    // jump's state when the new target takes the mounted fast path, where the
-    // superseded loop's finally no longer touches these signals.
-    setJumping(false)
-    setJumpPages(0)
-    setJumpElapsed(0)
-    setJumpChain(0)
-    setBusyID("")
-    lastJumpID = turn.id
-    const now = Date.now()
+    const path = routePath(ctx)
+    const sc = scroller()
+    const mounted = findRow(turn.id)
 
+    // Fast path: the row is already mounted (e.g. the prewarm reached it), so
+    // the jump is instant. If a prewarm is still running, re-target the host's
+    // pending oldest-seek to this turn first - otherwise the host would scroll
+    // to the oldest message when that seek completes and yank the viewport.
+    if (mounted && sc) {
+      if (warming()) {
+        cancelWarm()
+        if (path) navTo(path, turn.id)
+      }
+      alignAfterLand(mounted)
+      pulse(mounted)
+      return
+    }
+
+    const now = Date.now()
     // Same target clicked again shortly after: treat as idempotent re-scroll
     // instead of restarting the paging loop.
     if (turn.id === lastJumpTurnID && now - lastJumpAt < SAME_TARGET_WINDOW_MS) {
       const row = findRow(turn.id)
-      const sc = scroller()
       if (row && sc) {
         alignAfterLand(row)
         pulse(row)
@@ -908,45 +923,23 @@ function Rail(props) {
     }
     lastJumpAt = now
     lastJumpTurnID = turn.id
+    lastJumpID = turn.id
 
-    const sc = scroller()
-    const row = findRow(turn.id)
-
-    // Fast path: the row is mounted, scroll locally. No toast: the bubble
-    // ring is the feedback.
-    if (row && sc) {
-      alignAfterLand(row)
-      pulse(row)
-      return
-    }
-
-    const path = routePath(ctx)
     if (!path) {
       flash(`无法读取当前路由，无法定位 · ${diagnostics(ctx)}`)
       return
     }
 
-    // Deep history.
-    //
-    // The host's own seek machine does the heavy lifting: hash.changed ->
-    // applying -> pending(target) -> target.synced -> seek, and it loads the
-    // missing history asynchronously (up to 12 internal retries). Every extra
-    // hash change we send RESETS that pending state and aborts the history
-    // fetch in flight, which is why hammering the hash made a deep jump
-    // advance a single page at a time.
-    //
-    // So: set the hash once, then be patient. Only when the host has been
-    // completely idle for JUMP_IDLE_MS do we bounce the hash through a
-    // mounted turn to kick off a fresh chain.
+    const token = ++jumpToken
     const sessionAtJump = sessionID()
     setJumping(true)
     setBusyID(turn.id)
     setJumpPages(0)
     setJumpElapsed(0)
+    setJumpChain(0)
+    setWaitWarm(warming())
     // Pin the panel open even if the pointer has left it meanwhile.
     setOpen(true)
-    // The loading state is shown in the panel header and on the target row -
-    // no toast needed, the toast would land outside the user's focus.
     const startedAt = Date.now()
     const elapsedTimer = setInterval(() => {
       setJumpElapsed(Math.round((Date.now() - startedAt) / 1000))
@@ -955,6 +948,34 @@ function Rail(props) {
     // the per-chain counter, the headline must not go backwards).
     let chainBase = 0
     try {
+      // A prewarm is already paging the history (it seeks the oldest turn, so
+      // it passes through this one on the way). Don't fight it with a competing
+      // seek: just wait for the row to mount, then land. The header reads
+      // "预热中 · 稍等一下" while we wait.
+      if (warming()) {
+        const landed = await waitForRow(turn.id, token, 120000, (pages) => setJumpPages(pages))
+        if (token !== jumpToken || sessionID() !== sessionAtJump) return
+        if (landed) {
+          cancelWarm()
+          navTo(path, turn.id)
+          alignAfterLand(landed)
+          pulse(landed)
+          return
+        }
+        // The prewarm ran out without mounting the row: fall back to driving
+        // the host's seek ourselves below.
+        if (warming()) cancelWarm()
+        setWaitWarm(false)
+        if (token !== jumpToken || sessionID() !== sessionAtJump) return
+      }
+
+      // Deep history, no prewarm. The host's own seek machine does the heavy
+      // lifting: hash.changed -> applying -> pending(target) -> target.synced
+      // -> seek, loading the missing history asynchronously. Every extra hash
+      // change RESETS that pending state and aborts the fetch in flight, which
+      // is why hammering the hash made a deep jump advance one page per click.
+      // So: set the hash once, then be patient; only bounce it through a
+      // mounted turn when the host has been idle for JUMP_IDLE_MS.
       const deadline = Date.now() + JUMP_TOTAL_MS
       for (let chain = 0; chain < JUMP_ROUNDS && Date.now() < deadline; chain++) {
         // Abandon the loop if the user switched sessions mid-jump: toggling the
@@ -1005,6 +1026,7 @@ function Rail(props) {
         setJumpElapsed(0)
         setJumpChain(0)
         setBusyID("")
+        setWaitWarm(false)
       }
     }
   }
@@ -1102,6 +1124,37 @@ function Rail(props) {
     }
   }
 
+  // Session switch: abort any jump/prewarm in flight - they target the old
+  // route, and toggling its hash would navigate back to the previous session.
+  let guardSid = untrack(sessionID)
+  createEffect(() => {
+    const sid = sessionID()
+    if (sid === guardSid) return
+    guardSid = sid
+    cancelWarm()
+    jumpToken++
+    setJumping(false)
+    setJumpPages(0)
+    setJumpElapsed(0)
+    setJumpChain(0)
+    setBusyID("")
+    setWaitWarm(false)
+  })
+
+  // Resume the prewarm after a jump interrupted it, so the remaining older
+  // history still gets warmed for the next click. The initial start happens in
+  // load()'s finally (once the full turn list is in); this only fires when the
+  // warming signal flips back to false while the session is not fully warm.
+  createEffect(() => {
+    const sid = sessionID()
+    const count = turns().length
+    const hot = warming()
+    if (!sid || count < 15 || hot || warmedFor === sid) return
+    if (loadingActive || loadedFor !== sid) return
+    const timer = setTimeout(() => maybePrewarm(), 800)
+    onCleanup(() => clearTimeout(timer))
+  })
+
   // Keep the busy row visible in the panel list while the jump pages through
   // history, so the "which turn am I waiting for" answer stays on screen.
   createEffect(() => {
@@ -1144,7 +1197,8 @@ function Rail(props) {
             }
           >
             <span class="sr-title sr-progress">
-              加载历史中{jumpPages() > 0 ? ` · ${jumpPages()} 页` : ""}
+              {waitWarm() ? "预热中 · 稍等一下" : "加载历史中"}
+              {jumpPages() > 0 ? ` · ${jumpPages()} 页` : ""}
               {jumpElapsed() > 0 ? ` · ${jumpElapsed()}s` : ""}
             </span>
           </Show>
@@ -1177,7 +1231,7 @@ function Rail(props) {
                     {turn.text}
                   </span>
                   <Show when={jumping() && busyID() === turn.id}>
-                    <span class="sr-badge">加载中</span>
+                    <span class="sr-badge">{waitWarm() ? "稍等" : "加载中"}</span>
                   </Show>
                   <span class="sr-dash" />
                 </button>
