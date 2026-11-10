@@ -6,7 +6,7 @@ import { Portal } from "solid-js/web"
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v12"
+const VERSION = "v13"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
@@ -18,12 +18,13 @@ const FULL_PAGE_SIZE = 200
 const LIGHT_PAGE_SIZE = 50
 
 // jump loop budgets. One round pages in roughly one host history page (~5
-// turns); a round ends as soon as the host appends rows, so the loop is paced
-// by real progress instead of a fixed sleep.
+// turns); a round ends once the host's row set has stopped changing, so a
+// half-finished page is never interrupted by the next hash toggle.
 const JUMP_ROUNDS = 120
 const JUMP_TOTAL_MS = 45000
-const JUMP_ROW_TIMEOUT_MS = 4000
+const JUMP_ROW_TIMEOUT_MS = 3000
 const JUMP_SETTLE_MS = 300
+const JUMP_TOGGLE_DWELL_MS = 220
 const SAME_TARGET_WINDOW_MS = 800
 
 // Filled by Rail.load()/jump() so the command palette can report diagnostics.
@@ -89,12 +90,33 @@ const diagnostics = (ctx) => {
 }
 
 const scrollToRow = (scroller, row) => {
-  // Native scrolling reaches the real scroll ancestor without depending on
-  // the viewport selector; then compensate for the sticky session title.
-  row.scrollIntoView({ block: "start" })
+  // Align by rects instead of scrollIntoView: the host puts the row top flush
+  // against the sticky session title, but a 16px gradient fade sits right below
+  // it and would cover the top of the bubble (and our outline). Leave 24px so
+  // the bubble clears both the title and the fade.
   const title = scroller.querySelector("[data-session-title]")
-  const inset = title instanceof HTMLElement ? title.offsetHeight : 0
-  if (inset) scroller.scrollTop -= inset + 12
+  const scRect = scroller.getBoundingClientRect()
+  const titleBottom =
+    title instanceof HTMLElement ? title.getBoundingClientRect().bottom : scRect.top
+  const rowTop = row.getBoundingClientRect().top
+  const delta = rowTop - (titleBottom + 24)
+  if (Math.abs(delta) > 2) scroller.scrollTop += delta
+}
+
+// The host's own hash seek may finish after ours and re-align the row flush
+// under the sticky title (its 16px fade then covers the bubble's top edge).
+// Repair only that case: if the user already scrolled elsewhere, leave it be.
+const repairScroll = (row) => {
+  setTimeout(() => {
+    if (!row.isConnected) return
+    const sc = findScroller()
+    if (!sc) return
+    const title = sc.querySelector("[data-session-title]")
+    const titleBottom =
+      title instanceof HTMLElement ? title.getBoundingClientRect().bottom : sc.getBoundingClientRect().top
+    const rowTop = row.getBoundingClientRect().top
+    if (rowTop < titleBottom + 4) sc.scrollTop += rowTop - (titleBottom + 24)
+  }, 300)
 }
 
 // The desktop app (2.2.6) routes through a memory history, so window.location is
@@ -733,6 +755,8 @@ function Rail(props) {
       let timer
       const started = Date.now()
       const baseline = rowSignature()
+      let lastSig = baseline
+      let stableSince = started
       const finish = (row) => {
         if (done) return
         done = true
@@ -749,8 +773,20 @@ function Rail(props) {
         // data-attribute fallback (a full scan) and the row fingerprint.
         const row = full ? findRow(messageID) : document.getElementById(`${HASH_PREFIX}${messageID}`)
         if (row) return finish(row)
-        // Let the click settle before trusting a DOM change as "a page arrived".
-        if (full && Date.now() - started > JUMP_SETTLE_MS && rowSignature() !== baseline) finish(null)
+        if (!full) return
+        const sig = rowSignature()
+        const now = Date.now()
+        if (sig !== lastSig) {
+          lastSig = sig
+          stableSince = now
+          return
+        }
+        // Only treat the page as done once the host has stopped appending rows
+        // for a moment: toggling the hash mid-load cancels its paging and the
+        // jump stalls until the user clicks again.
+        if (now - started > JUMP_SETTLE_MS && lastSig !== baseline && now - stableSince > 350) {
+          finish(null)
+        }
       }
       const existing = findRow(messageID)
       if (existing) return finish(existing)
@@ -769,6 +805,15 @@ function Rail(props) {
   }
 
   const jump = async (turn) => {
+    // Clicking the same turn again while its jump is running must NOT restart
+    // the loop: every restart cancels the host's in-flight page load, which is
+    // what makes a deep jump advance only one page per click. Re-affirm the
+    // progress instead and let the running loop finish.
+    if (jumping() && busyID() === turn.id) {
+      flash(`正在跳转 · 第 ${jumpPage()} 页`, JUMP_TOTAL_MS)
+      return
+    }
+
     const token = ++jumpToken
     // A new click always owns the progress UI. This also clears a previous
     // jump's state when the new target takes the mounted fast path, where the
@@ -836,7 +881,10 @@ function Rail(props) {
           const other = oldestLoadedTurn() ?? turns()[0]
           if (other) {
             navTo(path, other.id)
-            await sleep(120)
+            // Let the host commit the intermediate hash before seeking back;
+            // too fast and both clicks collapse into the same target hash, so
+            // the cursor machine never runs another page.
+            await sleep(JUMP_TOGGLE_DWELL_MS)
           }
         }
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
@@ -850,6 +898,7 @@ function Rail(props) {
           if (live) scrollToRow(live, landed)
           pulse(landed)
           flash("已定位")
+          repairScroll(landed)
           return
         }
       }
