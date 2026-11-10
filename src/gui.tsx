@@ -6,10 +6,11 @@ import { Portal } from "solid-js/web"
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v15"
+const VERSION = "v16"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
+const WARM_EVENT = "session-turns:warm"
 
 // paging: a full load walks every page; a light refresh pulls just the newest
 // page (new messages always land at the head of a desc listing).
@@ -243,6 +244,20 @@ const CSS = `
   flex-shrink: 0;
 }
 .sr-close:hover { opacity: 1; background: var(--surface-base-hover, rgba(127,127,127,.14)); }
+.sr-warm {
+  border: 1px solid rgba(127,127,127,.28);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 7px;
+  border-radius: 5px;
+  cursor: pointer;
+  opacity: .6;
+  flex-shrink: 0;
+}
+.sr-warm:hover { opacity: 1; background: var(--surface-base-hover, rgba(127,127,127,.14)); }
 /* the scrollable list; the header stays fixed above it */
 .sr-list {
   flex: 1;
@@ -359,24 +374,20 @@ const CSS = `
   0%, 100% { opacity: .35; }
   50% { opacity: 1; }
 }
-/* pulse a landed bubble: outline follows the bubble's own border-radius, so no
-   shape is imposed and the message background stays untouched */
+/* pulse a landed bubble: an INSET ring, so it follows the bubble's own
+   border-radius and can never be clipped by an ancestor that clips overflow
+   (the timeline rows do) - an outline/box-shadow drawn outside the bubble
+   loses its top edge exactly where the row clips. */
 .sr-flash-ring { animation: srRing 1.8s ease-out 1; }
 @keyframes srRing {
   0% {
-    outline: 2px solid rgba(255,170,60,.95);
-    outline-offset: 2px;
-    box-shadow: 0 0 24px rgba(255,170,60,.45);
+    box-shadow: inset 0 0 0 2px rgba(255,170,60,.95), inset 0 0 26px rgba(255,170,60,.30);
   }
-  60% {
-    outline: 2px solid rgba(255,170,60,.35);
-    outline-offset: 2px;
-    box-shadow: 0 0 12px rgba(255,170,60,.15);
+  55% {
+    box-shadow: inset 0 0 0 2px rgba(255,170,60,.40), inset 0 0 14px rgba(255,170,60,.12);
   }
   100% {
-    outline: 2px solid rgba(255,170,60,0);
-    outline-offset: 2px;
-    box-shadow: 0 0 0 rgba(255,170,60,0);
+    box-shadow: inset 0 0 0 2px rgba(255,170,60,0), inset 0 0 0 rgba(255,170,60,0);
   }
 }
 .sr-note {
@@ -707,12 +718,18 @@ function Rail(props) {
     const onDiag = () => flash(`${VERSION} · ${diagnostics(ctx)}`)
     // /turns toggles the panel; Esc / outside click / × also close it. No more
     // forced auto-close after 4s.
-    const onOpen = () => setOpen((value) => !value)
+    const onOpen = () => {
+      setOpen((value) => !value)
+      maybePrewarm()
+    }
+    const onWarm = () => void prewarm()
     window.addEventListener(DIAG_EVENT, onDiag)
     window.addEventListener(OPEN_EVENT, onOpen)
+    window.addEventListener(WARM_EVENT, onWarm)
     onCleanup(() => {
       window.removeEventListener(DIAG_EVENT, onDiag)
       window.removeEventListener(OPEN_EVENT, onOpen)
+      window.removeEventListener(WARM_EVENT, onWarm)
     })
     // One-shot confirmation that this window actually runs the rebuilt bundle.
     flash(`会话轮次 ${VERSION} 已加载`)
@@ -838,6 +855,9 @@ function Rail(props) {
   }
 
   const jump = async (turn) => {
+    // A jump takes priority over a background prewarm.
+    if (warming()) cancelWarm()
+
     // Clicking the same turn again while its jump is running must NOT restart
     // the loop: every restart cancels the host's in-flight page load, which is
     // what makes a deep jump advance only one page per click. Re-affirm the
@@ -974,6 +994,111 @@ function Rail(props) {
     }
   }
 
+  // ---- prewarm ------------------------------------------------------------
+  // The host loads history one page at a time with a hard 2s cooldown between
+  // pages (its own paging machine: AS=2e3), which is why a deep jump waits
+  // several seconds. The plugin can pay that cost in advance: ask the host to
+  // seek to the OLDEST turn - its seek machine then pages all the way back -
+  // and restore the viewport afterwards. Once the store holds the whole
+  // history every jump is instant.
+  const [warming, setWarming] = createSignal(false)
+  const [warmPages, setWarmPages] = createSignal(0)
+  let warmToken = 0
+  let warmedFor = ""
+
+  // The topmost visible row plus its offset, so the viewport can be restored.
+  const viewAnchor = () => {
+    const sc = scroller()
+    if (!sc) return undefined
+    const scRect = sc.getBoundingClientRect()
+    for (const row of sc.querySelectorAll("[data-message-id]")) {
+      const rect = row.getBoundingClientRect()
+      if (rect.bottom <= scRect.top + 1) continue
+      const id = row.getAttribute("data-message-id")
+      if (!id) continue
+      return { id, offset: rect.top - scRect.top }
+    }
+    return undefined
+  }
+
+  const restoreView = (anchor) => {
+    if (!anchor) return
+    const sc = scroller()
+    if (!sc) return
+    const row = findRow(anchor.id)
+    if (!row) return
+    const scRect = sc.getBoundingClientRect()
+    const delta = row.getBoundingClientRect().top - scRect.top - anchor.offset
+    if (Math.abs(delta) > 2) sc.scrollTop += delta
+  }
+
+  const cancelWarm = () => {
+    warmToken++
+    setWarming(false)
+  }
+
+  // Prewarm once per session, when the user shows interest in the rail (hover
+  // or /turns). Long sessions only - short ones are already instant.
+  const maybePrewarm = () => {
+    const sid = sessionID()
+    if (!sid || warming()) return
+    if (warmedFor === sid) return
+    if (turns().length < 15) return
+    void prewarm()
+  }
+
+  const prewarm = async () => {
+    if (warming()) return
+    const path = routePath(ctx)
+    const oldest = turns()[0]
+    const sid = sessionID()
+    if (!path || !oldest || !sid) return
+    // Already warm: the oldest turn is mounted, so the store has the history.
+    if (warmedFor === sid && findRow(oldest.id)) {
+      flash("历史已就绪")
+      return
+    }
+    const token = ++warmToken
+    const anchor = viewAnchor()
+    const sc = scroller()
+    const wasAtBottom = sc ? sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 32 : true
+    setWarming(true)
+    setWarmPages(0)
+    flash("正在预热历史…", 120000)
+    try {
+      navTo(path, oldest.id)
+      const deadline = Date.now() + 120000
+      let pages = 0
+      let lastSig = rowSignature()
+      const keep = setInterval(() => restoreView(anchor), 150)
+      try {
+        while (Date.now() < deadline && token === warmToken) {
+          if (findRow(oldest.id)) break
+          await sleep(250)
+          const sig = rowSignature()
+          if (sig !== lastSig) {
+            lastSig = sig
+            pages++
+            setWarmPages(pages)
+          }
+        }
+      } finally {
+        clearInterval(keep)
+      }
+      if (token !== warmToken) return
+      // The host scrolled to the oldest message; put the viewport back.
+      restoreView(anchor)
+      if (wasAtBottom) {
+        const live = scroller()
+        if (live) live.scrollTop = live.scrollHeight
+      }
+      warmedFor = sid
+      flash(`历史已预热（${pages} 页），现在跳转是瞬时的`)
+    } finally {
+      if (token === warmToken) setWarming(false)
+    }
+  }
+
   // Keep the busy row visible in the panel list while the jump pages through
   // history, so the "which turn am I waiting for" answer stays on screen.
   createEffect(() => {
@@ -997,7 +1122,10 @@ function Rail(props) {
         class="sr-rail"
         data-open={open() ? "true" : "false"}
         data-jumping={jumping() ? "true" : "false"}
-        onMouseEnter={() => setOpen(true)}
+        onMouseEnter={() => {
+          setOpen(true)
+          maybePrewarm()
+        }}
         // Keep the panel pinned while a long history jump runs; otherwise the
         // mouse drifting off the rail hides exactly the progress the user is
         // waiting for. Esc / × still close (or cancel) it.
@@ -1007,16 +1135,25 @@ function Rail(props) {
       >
         <div class="sr-head">
           <Show
-            when={jumping()}
+            when={jumping() || warming()}
             fallback={
               <span class="sr-title">会话轮次{turns().length > 0 ? ` · ${turns().length}` : ""}</span>
             }
           >
             <span class="sr-title sr-progress">
-              跳转中{jumpPages() > 0 ? ` · 已加载 ${jumpPages()} 页` : ""}
-              {jumpElapsed() > 0 ? ` · ${jumpElapsed()}s` : ""}
+              {jumping()
+                ? `跳转中${jumpPages() > 0 ? ` · 已加载 ${jumpPages()} 页` : ""}${jumpElapsed() > 0 ? ` · ${jumpElapsed()}s` : ""}`
+                : `预热中${warmPages() > 0 ? ` · ${warmPages()} 页` : ""}`}
             </span>
           </Show>
+          <button
+            type="button"
+            class="sr-warm"
+            title="预热历史：后台把会话历史加载完，之后跳转瞬时"
+            onClick={() => window.dispatchEvent(new Event(WARM_EVENT))}
+          >
+            预热
+          </button>
           <button
             type="button"
             class="sr-close"
