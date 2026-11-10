@@ -39,7 +39,7 @@
   "scripts": {
     "build": "vite build",
     "dev": "vite build --watch",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "node scripts/ensure-ci-publish.mjs && npm run build"
   },
   "devDependencies": {
     "@opencode/plugin": "^2.2.6",

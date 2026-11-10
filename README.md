@@ -88,6 +88,17 @@ npm run build      # -> dist/gui-experimental.cjs
 改完源码后重新构建，并在 OpenCode Desktop 里 Reload 插件
 （Settings → Extensions → Plugins → Reload）或重启应用。
 
+## 发布
+
+版本发布只通过 GitHub Actions（`.github/workflows/publish.yml`）；本地 `npm publish` 已被 `prepublishOnly` 守卫禁止：
+
+```sh
+npm version patch   # 或 minor / major：自动改版本、提交并打 v* tag
+git push --follow-tags origin main
+```
+
+CI 会校验 tag 与 `package.json` 版本一致，随后构建并发布到 npm。
+
 ## 许可证
 
 MIT © meiyx7

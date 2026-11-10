@@ -1,5 +1,9 @@
 name: Publish to npm
 
+# Releases ship only from GitHub Actions: bump the version, push a `v*` tag, and
+# this workflow verifies the tag, builds and publishes. Local `npm publish` is
+# blocked by the prepublishOnly guard in package.json.
+
 on:
   push:
     tags:
@@ -7,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish (e.g. 0.1.12 or v0.1.12)"
+        description: "Version to publish (e.g. 0.1.16 or v0.1.16)"
         required: true
 
 permissions:
@@ -27,21 +31,21 @@ jobs:
 
       - run: npm ci
 
-      - name: Resolve version
-        id: ver
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ inputs.version }}"
-          else
-            VERSION="${GITHUB_REF_NAME}"
+          tag="${GITHUB_REF#refs/tags/v}"
+          version="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$version" ]; then
+            echo "Tag v$tag does not match package.json $version" >&2
+            exit 1
           fi
-          VERSION="${VERSION#v}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Set version
-        run: npm version ${{ steps.ver.outputs.version }} --no-git-tag-version --allow-same-version
+      - name: Set version (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        run: npm version "${{ inputs.version }}" --no-git-tag-version --allow-same-version
 
-      # prepublishOnly runs `npm run build`, so the bundle is always built here.
+      # prepublishOnly builds the bundle and enforces CI-only publishing.
       - name: Publish
         run: npm publish --access public
         env:
