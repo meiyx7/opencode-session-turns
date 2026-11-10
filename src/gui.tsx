@@ -6,7 +6,7 @@ import { Portal } from "solid-js/web"
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v19"
+const VERSION = "v20"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
@@ -502,7 +502,10 @@ function Rail(props) {
     loadingActive = true
     // A full (re)load means the host store may be cold again (session open or
     // server rebuild): invalidate the prewarm marker so it runs once more.
-    if (mode === "full") warmedFor = ""
+    if (mode === "full") {
+      warmedFor = ""
+      warmBlockedFor = ""
+    }
     let error = ""
     try {
       let cursor
@@ -552,7 +555,7 @@ function Rail(props) {
       // Prewarm long sessions as soon as their full turn list has loaded, so
       // the history is warm before the first click (not only on rail hover).
       if (mode === "full" && !error && id === untrack(sessionID) && cache.size >= 15) {
-        setTimeout(() => maybePrewarm(), 800)
+        setTimeout(() => maybePrewarm(), 1200)
       }
     }
   }
@@ -953,7 +956,7 @@ function Rail(props) {
       // seek: just wait for the row to mount, then land. The header reads
       // "预热中 · 稍等一下" while we wait.
       if (warming()) {
-        const landed = await waitForRow(turn.id, token, 120000, (pages) => setJumpPages(pages))
+        const landed = await waitForRow(turn.id, token, 20000, (pages) => setJumpPages(pages))
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         if (landed) {
           cancelWarm()
@@ -1041,6 +1044,10 @@ function Rail(props) {
   const [warming, setWarming] = createSignal(false)
   let warmToken = 0
   let warmedFor = ""
+  // Set when a prewarm gave up without reaching the oldest turn (the host never
+  // engaged). The auto-resume effect must not retry it in a loop; an explicit
+  // hover or a fresh full load still may.
+  let warmBlockedFor = ""
 
   // The topmost visible row plus its offset, so the viewport can be restored.
   const viewAnchor = () => {
@@ -1100,24 +1107,61 @@ function Rail(props) {
     setWarming(true)
     try {
       navTo(path, oldest.id)
-      const deadline = Date.now() + 120000
+      // The host's seek machine starts inactive and DROPS a seek issued before
+      // the timeline is ready - exactly the situation on session open. So don't
+      // wait blindly for the oldest row: watch for real paging progress, and if
+      // the host goes silent, bounce the hash to re-engage it once it is ready.
+      // If it never engages, bail fast (without marking warm) so clicks fall
+      // back to a direct jump instead of all showing "预热中 · 稍等一下" for 2min.
+      const deadline = Date.now() + 60000
+      let lastSig = rowSignature()
+      let lastChange = Date.now()
+      let kicks = 0
       const keep = setInterval(() => restoreView(anchor), 150)
       try {
         while (Date.now() < deadline && token === warmToken) {
           if (findRow(oldest.id)) break
           await sleep(250)
+          if (token !== warmToken) break
+          const now = Date.now()
+          const sig = rowSignature()
+          if (sig !== lastSig) {
+            // Real progress: the host is paging. Keep waiting, reset the kick budget.
+            lastSig = sig
+            lastChange = now
+            kicks = 0
+          } else if (now - lastChange > 5000) {
+            if (kicks >= 2) break // host never engaged: give up, stay un-warm
+            // Re-engage: a repeated identical hash is ignored by the router, so
+            // bounce through a mounted turn first, then back to the oldest.
+            const other = oldestLoadedTurn()
+            if (other && other.id !== oldest.id) {
+              navTo(path, other.id)
+              await sleep(JUMP_TOGGLE_DWELL_MS)
+              if (token !== warmToken) break
+            }
+            navTo(path, oldest.id)
+            lastChange = Date.now()
+            kicks++
+          }
         }
       } finally {
         clearInterval(keep)
       }
       if (token !== warmToken) return
+      const done = !!findRow(oldest.id)
       // The host scrolled to the oldest message; put the viewport back.
       restoreView(anchor)
       if (wasAtBottom) {
         const live = scroller()
         if (live) live.scrollTop = live.scrollHeight
       }
-      warmedFor = sid
+      if (done) {
+        warmedFor = sid
+      } else {
+        // Never claim the history is ready when the oldest turn never mounted.
+        warmBlockedFor = sid
+      }
       // Silent on success: prewarming is an implementation detail.
     } finally {
       if (token === warmToken) setWarming(false)
@@ -1145,13 +1189,15 @@ function Rail(props) {
   // history still gets warmed for the next click. The initial start happens in
   // load()'s finally (once the full turn list is in); this only fires when the
   // warming signal flips back to false while the session is not fully warm.
+  // A prewarm that gave up (warmBlockedFor) is NOT retried here, otherwise a
+  // host that never engages would loop forever and keep every click on "稍等".
   createEffect(() => {
     const sid = sessionID()
     const count = turns().length
     const hot = warming()
-    if (!sid || count < 15 || hot || warmedFor === sid) return
+    if (!sid || count < 15 || hot || warmedFor === sid || warmBlockedFor === sid) return
     if (loadingActive || loadedFor !== sid) return
-    const timer = setTimeout(() => maybePrewarm(), 800)
+    const timer = setTimeout(() => maybePrewarm(), 1200)
     onCleanup(() => clearTimeout(timer))
   })
 
