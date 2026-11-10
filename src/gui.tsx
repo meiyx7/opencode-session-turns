@@ -6,7 +6,7 @@ import { Portal } from "solid-js/web"
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v11"
+const VERSION = "v12"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
@@ -17,10 +17,13 @@ const FULL_PAGE_LIMIT = 40
 const FULL_PAGE_SIZE = 200
 const LIGHT_PAGE_SIZE = 50
 
-// jump loop budgets
-const JUMP_ROUNDS = 30
-const JUMP_TOTAL_MS = 15000
-const JUMP_ROW_TIMEOUT_MS = 6000
+// jump loop budgets. One round pages in roughly one host history page (~5
+// turns); a round ends as soon as the host appends rows, so the loop is paced
+// by real progress instead of a fixed sleep.
+const JUMP_ROUNDS = 120
+const JUMP_TOTAL_MS = 45000
+const JUMP_ROW_TIMEOUT_MS = 4000
+const JUMP_SETTLE_MS = 300
 const SAME_TARGET_WINDOW_MS = 800
 
 // Filled by Rail.load()/jump() so the command palette can report diagnostics.
@@ -180,6 +183,11 @@ const CSS = `
 }
 .sr-rail[data-open="true"] .sr-head { display: flex; }
 .sr-title { font-size: 12px; opacity: .6; white-space: nowrap; }
+.sr-title.sr-progress {
+  opacity: .95;
+  color: rgba(255,170,60,.95);
+  font-variant-numeric: tabular-nums;
+}
 .sr-close {
   border: 0;
   background: transparent;
@@ -293,11 +301,39 @@ const CSS = `
 .sr-rail[data-open="true"] .sr-turn:hover .sr-text,
 .sr-rail[data-open="true"] .sr-turn[data-active="true"] .sr-text { opacity: 1; }
 .sr-turn[data-active="true"] { font-weight: 500; }
-/* brief highlight of the row a jump landed on */
-.sr-flash-target { animation: srPulse 1.5s ease-out 1; }
-@keyframes srPulse {
-  0%, 30% { background: rgba(255,170,60,.4); }
-  100% { background: transparent; }
+/* the turn currently being jumped to */
+.sr-turn[data-busy="true"] { background: rgba(255,170,60,.12); }
+.sr-turn[data-busy="true"] .sr-dash {
+  opacity: 1;
+  width: 3px;
+  height: 22px;
+  background: rgba(255,170,60,.95);
+  animation: srBusy 1s ease-in-out infinite;
+}
+.sr-turn[data-busy="false"] .sr-dash { animation: none; }
+@keyframes srBusy {
+  0%, 100% { opacity: .35; }
+  50% { opacity: 1; }
+}
+/* pulse a landed bubble: outline follows the bubble's own border-radius, so no
+   shape is imposed and the message background stays untouched */
+.sr-flash-ring { animation: srRing 1.8s ease-out 1; }
+@keyframes srRing {
+  0% {
+    outline: 2px solid rgba(255,170,60,.95);
+    outline-offset: 2px;
+    box-shadow: 0 0 24px rgba(255,170,60,.45);
+  }
+  60% {
+    outline: 2px solid rgba(255,170,60,.35);
+    outline-offset: 2px;
+    box-shadow: 0 0 12px rgba(255,170,60,.15);
+  }
+  100% {
+    outline: 2px solid rgba(255,170,60,0);
+    outline-offset: 2px;
+    box-shadow: 0 0 0 rgba(255,170,60,0);
+  }
 }
 .sr-note {
   display: none;
@@ -334,6 +370,11 @@ function Rail(props) {
   const [open, setOpen] = createSignal(false)
   const [note, setNote] = createSignal("")
   const [status, setStatus] = createSignal("")
+  // Jump progress. While `jumping` is true the panel stays pinned open and the
+  // header reports the page being loaded; `busyID` marks the target row.
+  const [jumping, setJumping] = createSignal(false)
+  const [jumpPage, setJumpPage] = createSignal(0)
+  const [busyID, setBusyID] = createSignal("")
 
   // ---- turn cache ---------------------------------------------------------
   // Object identity is kept stable across refreshes so Solid's <For> reuses
@@ -588,6 +629,13 @@ function Rail(props) {
   onMount(() => {
     const onKey = (event) => {
       if (event.key !== "Escape") return
+      // During a long jump Esc cancels the jump first and keeps the panel open,
+      // so the progress display doesn't vanish mid-flight.
+      if (untrack(jumping)) {
+        cancelJump()
+        event.stopPropagation()
+        return
+      }
       if (untrack(open)) {
         setOpen(false)
         // Only swallow Esc while the rail is actually open, so the host keeps
@@ -632,14 +680,21 @@ function Rail(props) {
   let lastJumpAt = 0
   let lastJumpTurnID = ""
 
-  // Brief highlight on the row a jump landed on. The row may be unmounted by
-  // the virtual list right after; the timer then just no-ops.
+  // Brief highlight on the message bubble. The timeline row spans the whole
+  // width, so tinting it looks like a stray orange band. The visible bubble is
+  // `[data-slot="user-message-text"]` (background + 10px radius); its parent
+  // `user-message-body` is only a layout column. An outline + glow hugs the
+  // bubble's own shape without altering its background.
   const pulse = (row) => {
     try {
-      row.classList.remove("sr-flash-target")
-      void row.offsetWidth // restart the animation when re-pulsing the same row
-      row.classList.add("sr-flash-target")
-      setTimeout(() => row.classList.remove("sr-flash-target"), 1600)
+      const target =
+        row.querySelector('[data-slot="user-message-text"]') ??
+        row.querySelector('[data-slot="user-message-body"]') ??
+        row
+      target.classList.remove("sr-flash-ring")
+      void target.offsetWidth // restart the animation when re-pulsing the same node
+      target.classList.add("sr-flash-ring")
+      setTimeout(() => target.classList.remove("sr-flash-ring"), 1900)
     } catch {}
   }
 
@@ -655,14 +710,29 @@ function Rail(props) {
     lastNavID = id
   }
 
+  // Cheap fingerprint of the mounted timeline rows. Paging in older history
+  // prepends rows, so a changed fingerprint means the host did real work and
+  // the next hash toggle can be sent immediately.
+  const rowSignature = () => {
+    const sc = scroller()
+    const rows = sc?.querySelectorAll("[data-message-id]") ?? []
+    if (rows.length === 0) return "0"
+    const first = rows[0].getAttribute("data-message-id") ?? ""
+    const last = rows[rows.length - 1].getAttribute("data-message-id") ?? ""
+    return `${rows.length}:${first}:${last}`
+  }
+
   // Resolves when the row enters the DOM (MutationObserver, with a cheap poll
-  // as a belt-and-braces fallback), or null on timeout / supersession.
+  // as a belt-and-braces fallback), or null on timeout / supersession / when
+  // the host has paged in another slice (the caller then drives the next seek).
   const waitForRow = (messageID, token, timeout) =>
     new Promise((resolve) => {
       let done = false
       let observer
       let poll
       let timer
+      const started = Date.now()
+      const baseline = rowSignature()
       const finish = (row) => {
         if (done) return
         done = true
@@ -673,18 +743,30 @@ function Rail(props) {
         clearTimeout(timer)
         resolve(row ?? null)
       }
-      const check = () => {
+      const check = (full) => {
         if (token !== jumpToken) return finish(null)
         const row = findRow(messageID)
-        if (row) finish(row)
+        if (row) return finish(row)
+        // Let the click settle before trusting a DOM change as "a page arrived".
+        // Only the poll evaluates the row fingerprint: streaming output fires
+        // the observer constantly and a full query on every mutation is wasted.
+        if (full && Date.now() - started > JUMP_SETTLE_MS && rowSignature() !== baseline) finish(null)
       }
       const existing = findRow(messageID)
       if (existing) return finish(existing)
-      observer = new MutationObserver(check)
+      observer = new MutationObserver(() => check(false))
       observer.observe(document.documentElement, { childList: true, subtree: true })
-      poll = setInterval(check, 120)
+      poll = setInterval(() => check(true), 120)
       timer = setTimeout(() => finish(findRow(messageID)), Math.max(400, timeout))
     })
+
+  const cancelJump = () => {
+    jumpToken++
+    setJumping(false)
+    setJumpPage(0)
+    setBusyID("")
+    flash("已取消跳转")
+  }
 
   const jump = async (turn) => {
     const token = ++jumpToken
@@ -722,39 +804,71 @@ function Rail(props) {
       return
     }
 
-    // The host only pages in ~one history page (~5 turns) per seek and then goes
-    // idle. Drive it: each round toggles the hash to an already-loaded turn and
-    // back to the target, so the cursor machine runs another seek/page.
-    // A newer click bumps jumpToken, which cancels this loop at every await.
-    const deadline = Date.now() + JUMP_TOTAL_MS
-    for (let round = 0; round < JUMP_ROUNDS && Date.now() < deadline; round++) {
-      if (token !== jumpToken) return
-      flash(round === 0 ? "定位中…" : `加载历史… ${round}`)
+    // Deep history: the host only pages in ~one history page (~5 turns) per
+    // seek and then goes idle. Drive it: each round toggles the hash to an
+    // already-loaded turn and back to the target, so the cursor machine runs
+    // another seek/page. A round ends as soon as rows appear instead of always
+    // sleeping 6s. A newer click bumps jumpToken, which cancels this loop at
+    // every await; Esc cancels it too.
+    setJumping(true)
+    setBusyID(turn.id)
+    setJumpPage(0)
+    // Pin the panel open even if the pointer has left it meanwhile.
+    setOpen(true)
+    flash("正在定位…", JUMP_TOTAL_MS)
+    try {
+      const deadline = Date.now() + JUMP_TOTAL_MS
+      for (let round = 0; round < JUMP_ROUNDS && Date.now() < deadline; round++) {
+        if (token !== jumpToken) return
+        setJumpPage(round + 1)
+        flash(`跳转中 · 第 ${round + 1} 页`, JUMP_TOTAL_MS)
 
-      if (lastNavID === turn.id) {
-        const other = oldestLoadedTurn() ?? turns()[0]
-        if (other) {
-          navTo(path, other.id)
-          await sleep(120)
+        if (lastNavID === turn.id) {
+          const other = oldestLoadedTurn() ?? turns()[0]
+          if (other) {
+            navTo(path, other.id)
+            await sleep(120)
+          }
+        }
+        if (token !== jumpToken) return
+        navTo(path, turn.id)
+
+        const remaining = Math.min(JUMP_ROW_TIMEOUT_MS, deadline - Date.now())
+        const landed = await waitForRow(turn.id, token, remaining)
+        if (token !== jumpToken) return
+        if (landed) {
+          const live = scroller() ?? sc
+          if (live) scrollToRow(live, landed)
+          pulse(landed)
+          flash("已定位")
+          return
         }
       }
-      if (token !== jumpToken) return
-      navTo(path, turn.id)
 
-      const remaining = Math.min(JUMP_ROW_TIMEOUT_MS, deadline - Date.now())
-      const landed = await waitForRow(turn.id, token, remaining)
-      if (token !== jumpToken) return
-      if (landed) {
-        const live = scroller() ?? sc
-        if (live) scrollToRow(live, landed)
-        pulse(landed)
-        flash("已定位")
-        return
+      if (token === jumpToken) flash(`未能定位 · ${diagnostics(ctx)}`)
+    } finally {
+      // A newer jump owns the signals when the token moved on.
+      if (token === jumpToken) {
+        setJumping(false)
+        setJumpPage(0)
+        setBusyID("")
       }
     }
-
-    if (token === jumpToken) flash(`未能定位 · ${diagnostics(ctx)}`)
   }
+
+  // Keep the busy row visible in the panel list while the jump pages through
+  // history, so the "which turn am I waiting for" answer stays on screen.
+  createEffect(() => {
+    if (!jumping()) return
+    if (!busyID()) return
+    requestAnimationFrame(() => {
+      try {
+        document
+          .querySelector('.sr-list .sr-turn[data-busy="true"]')
+          ?.scrollIntoView({ block: "nearest" })
+      } catch {}
+    })
+  })
 
   const rail = (
     <>
@@ -764,12 +878,35 @@ function Rail(props) {
       <div
         class="sr-rail"
         data-open={open() ? "true" : "false"}
+        data-jumping={jumping() ? "true" : "false"}
         onMouseEnter={() => setOpen(true)}
-        onMouseLeave={() => setOpen(false)}
+        // Keep the panel pinned while a long history jump runs; otherwise the
+        // mouse drifting off the rail hides exactly the progress the user is
+        // waiting for. Esc / × still close (or cancel) it.
+        onMouseLeave={() => {
+          if (!jumping()) setOpen(false)
+        }}
       >
         <div class="sr-head">
-          <span class="sr-title">会话轮次{turns().length > 0 ? ` · ${turns().length}` : ""}</span>
-          <button type="button" class="sr-close" title="关闭 (Esc)" onClick={() => setOpen(false)}>
+          <Show
+            when={jumping()}
+            fallback={
+              <span class="sr-title">会话轮次{turns().length > 0 ? ` · ${turns().length}` : ""}</span>
+            }
+          >
+            <span class="sr-title sr-progress">
+              跳转中{jumpPage() > 0 ? ` · 第 ${jumpPage()} 页` : ""}
+            </span>
+          </Show>
+          <button
+            type="button"
+            class="sr-close"
+            title={jumping() ? "取消跳转 (Esc)" : "关闭 (Esc)"}
+            onClick={() => {
+              if (jumping()) cancelJump()
+              else setOpen(false)
+            }}
+          >
             ×
           </button>
         </div>
@@ -781,6 +918,7 @@ function Rail(props) {
                   type="button"
                   class="sr-turn"
                   data-active={active() === turn.id ? "true" : "false"}
+                  data-busy={jumping() && busyID() === turn.id ? "true" : "false"}
                   onClick={() => void jump(turn)}
                 >
                   <span class="sr-text">
