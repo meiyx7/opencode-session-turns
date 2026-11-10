@@ -39,7 +39,7 @@ jobs:
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Set version
-        run: npm version ${{ steps.ver.outputs.version }} --no-git-tag-version
+        run: npm version ${{ steps.ver.outputs.version }} --no-git-tag-version --allow-same-version
 
       # prepublishOnly runs `npm run build`, so the bundle is always built here.
       - name: Publish
