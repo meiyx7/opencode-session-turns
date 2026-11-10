@@ -17,13 +17,18 @@ const FULL_PAGE_LIMIT = 40
 const FULL_PAGE_SIZE = 200
 const LIGHT_PAGE_SIZE = 50
 
-// jump loop budgets. One round pages in roughly one host history page (~5
-// turns); a round ends once the host's row set has stopped changing, so a
-// half-finished page is never interrupted by the next hash toggle.
-const JUMP_ROUNDS = 120
+// Jump budgets.
+//
+// The host loads missing history asynchronously and retries a missing seek up
+// to 12 times on its own. The plugin therefore does NOT poll the hash: it
+// sets it once and waits. JUMP_CHAIN_MS is how long a single chain may run,
+// JUMP_IDLE_MS how long the host may stay completely idle before the plugin
+// assumes the chain died and starts a new one.
+const JUMP_ROUNDS = 30
 const JUMP_TOTAL_MS = 45000
-const JUMP_ROW_TIMEOUT_MS = 3000
-const JUMP_SETTLE_MS = 300
+const JUMP_CHAIN_MS = 12000
+const JUMP_IDLE_MS = 5000
+const JUMP_FIRST_IDLE_MS = 9000
 const JUMP_TOGGLE_DWELL_MS = 220
 const SAME_TARGET_WINDOW_MS = 800
 
@@ -393,9 +398,11 @@ function Rail(props) {
   const [note, setNote] = createSignal("")
   const [status, setStatus] = createSignal("")
   // Jump progress. While `jumping` is true the panel stays pinned open and the
-  // header reports the page being loaded; `busyID` marks the target row.
+  // header reports what the host is doing; `busyID` marks the target row.
   const [jumping, setJumping] = createSignal(false)
-  const [jumpPage, setJumpPage] = createSignal(0)
+  const [jumpPages, setJumpPages] = createSignal(0)
+  const [jumpElapsed, setJumpElapsed] = createSignal(0)
+  const [jumpChain, setJumpChain] = createSignal(0)
   const [busyID, setBusyID] = createSignal("")
 
   // ---- turn cache ---------------------------------------------------------
@@ -744,10 +751,14 @@ function Rail(props) {
     return `${rows.length}:${first}:${last}`
   }
 
-  // Resolves when the row enters the DOM (MutationObserver, with a cheap poll
-  // as a belt-and-braces fallback), or null on timeout / supersession / when
-  // the host has paged in another slice (the caller then drives the next seek).
-  const waitForRow = (messageID, token, timeout) =>
+  // Waits until the target row is mounted.
+  //
+  // Resolves with the row on success, or null when the host stopped making
+  // progress (its own seek chain ran out) or the timeout hit. Crucially it
+  // does NOT resolve just because rows appeared: the host may still be
+  // fetching the rest of the history for this target, and interrupting it
+  // (by toggling the hash) is what made deep jumps crawl one page per click.
+  const waitForRow = (messageID, token, timeout, onPage) =>
     new Promise((resolve) => {
       let done = false
       let observer
@@ -756,7 +767,8 @@ function Rail(props) {
       const started = Date.now()
       const baseline = rowSignature()
       let lastSig = baseline
-      let stableSince = started
+      let lastChange = started
+      let pages = 0
       const finish = (row) => {
         if (done) return
         done = true
@@ -778,15 +790,17 @@ function Rail(props) {
         const now = Date.now()
         if (sig !== lastSig) {
           lastSig = sig
-          stableSince = now
+          lastChange = now
+          pages++
+          onPage?.(pages)
           return
         }
-        // Only treat the page as done once the host has stopped appending rows
-        // for a moment: toggling the hash mid-load cancels its paging and the
-        // jump stalls until the user clicks again.
-        if (now - started > JUMP_SETTLE_MS && lastSig !== baseline && now - stableSince > 350) {
-          finish(null)
-        }
+        // Nothing has changed for a while: the host has no more history in
+        // flight for this target. Before the first page lands we are even more
+        // patient - the initial fetch can take seconds, and bouncing the hash
+        // then would abort it.
+        const idleLimit = pages > 0 ? JUMP_IDLE_MS : JUMP_FIRST_IDLE_MS
+        if (now - lastChange > idleLimit) finish(null)
       }
       const existing = findRow(messageID)
       if (existing) return finish(existing)
@@ -799,7 +813,9 @@ function Rail(props) {
   const cancelJump = () => {
     jumpToken++
     setJumping(false)
-    setJumpPage(0)
+    setJumpPages(0)
+    setJumpElapsed(0)
+    setJumpChain(0)
     setBusyID("")
     flash("已取消跳转")
   }
@@ -810,7 +826,7 @@ function Rail(props) {
     // what makes a deep jump advance only one page per click. Re-affirm the
     // progress instead and let the running loop finish.
     if (jumping() && busyID() === turn.id) {
-      flash(`正在跳转 · 第 ${jumpPage()} 页`, JUMP_TOTAL_MS)
+      flash(`正在跳转 · 已加载 ${jumpPages()} 页 · ${jumpElapsed()}s`, JUMP_TOTAL_MS)
       return
     }
 
@@ -819,7 +835,9 @@ function Rail(props) {
     // jump's state when the new target takes the mounted fast path, where the
     // superseded loop's finally no longer touches these signals.
     setJumping(false)
-    setJumpPage(0)
+    setJumpPages(0)
+    setJumpElapsed(0)
+    setJumpChain(0)
     setBusyID("")
     lastJumpID = turn.id
     const now = Date.now()
@@ -855,43 +873,59 @@ function Rail(props) {
       return
     }
 
-    // Deep history: the host only pages in ~one history page (~5 turns) per
-    // seek and then goes idle. Drive it: each round toggles the hash to an
-    // already-loaded turn and back to the target, so the cursor machine runs
-    // another seek/page. A round ends as soon as rows appear instead of always
-    // sleeping 6s. A newer click bumps jumpToken, which cancels this loop at
-    // every await; Esc cancels it too.
+    // Deep history.
+    //
+    // The host's own seek machine does the heavy lifting: hash.changed ->
+    // applying -> pending(target) -> target.synced -> seek, and it loads the
+    // missing history asynchronously (up to 12 internal retries). Every extra
+    // hash change we send RESETS that pending state and aborts the history
+    // fetch in flight, which is why hammering the hash made a deep jump
+    // advance a single page at a time.
+    //
+    // So: set the hash once, then be patient. Only when the host has been
+    // completely idle for JUMP_IDLE_MS do we bounce the hash through a
+    // mounted turn to kick off a fresh chain.
     const sessionAtJump = sessionID()
     setJumping(true)
     setBusyID(turn.id)
-    setJumpPage(0)
+    setJumpPages(0)
+    setJumpElapsed(0)
     // Pin the panel open even if the pointer has left it meanwhile.
     setOpen(true)
     flash("正在定位…", JUMP_TOTAL_MS)
+    const startedAt = Date.now()
+    const elapsedTimer = setInterval(() => {
+      setJumpElapsed(Math.round((Date.now() - startedAt) / 1000))
+    }, 500)
     try {
       const deadline = Date.now() + JUMP_TOTAL_MS
-      for (let round = 0; round < JUMP_ROUNDS && Date.now() < deadline; round++) {
+      for (let chain = 0; chain < JUMP_ROUNDS && Date.now() < deadline; chain++) {
         // Abandon the loop if the user switched sessions mid-jump: toggling the
         // old route hash would navigate back to the previous session.
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
-        setJumpPage(round + 1)
-        flash(`跳转中 · 第 ${round + 1} 页`, JUMP_TOTAL_MS)
+        setJumpChain(chain + 1)
 
         if (lastNavID === turn.id) {
+          // The hash already points at the target and the host ignores a
+          // repeated hash value, so bounce through a mounted turn to force a
+          // fresh seek. This is the fallback path, not the normal one.
           const other = oldestLoadedTurn() ?? turns()[0]
           if (other) {
             navTo(path, other.id)
             // Let the host commit the intermediate hash before seeking back;
-            // too fast and both clicks collapse into the same target hash, so
-            // the cursor machine never runs another page.
+            // too fast and both clicks collapse into the same target hash.
             await sleep(JUMP_TOGGLE_DWELL_MS)
           }
         }
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         navTo(path, turn.id)
+        flash(`跳转中 · 已加载 ${jumpPages()} 页`, JUMP_TOTAL_MS)
 
-        const remaining = Math.min(JUMP_ROW_TIMEOUT_MS, deadline - Date.now())
-        const landed = await waitForRow(turn.id, token, remaining)
+        const remaining = Math.min(JUMP_CHAIN_MS, deadline - Date.now())
+        const landed = await waitForRow(turn.id, token, remaining, (pages) => {
+          setJumpPages(pages)
+          flash(`跳转中 · 已加载 ${pages} 页`, JUMP_TOTAL_MS)
+        })
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         if (landed) {
           const live = scroller() ?? sc
@@ -901,14 +935,19 @@ function Rail(props) {
           repairScroll(landed)
           return
         }
+        // The host went idle without landing: it exhausted this chain. The
+        // next iteration bounces the hash to start a new one.
       }
 
       if (token === jumpToken) flash(`未能定位 · ${diagnostics(ctx)}`)
     } finally {
+      clearInterval(elapsedTimer)
       // A newer jump owns the signals when the token moved on.
       if (token === jumpToken) {
         setJumping(false)
-        setJumpPage(0)
+        setJumpPages(0)
+        setJumpElapsed(0)
+        setJumpChain(0)
         setBusyID("")
       }
     }
@@ -953,7 +992,8 @@ function Rail(props) {
             }
           >
             <span class="sr-title sr-progress">
-              跳转中{jumpPage() > 0 ? ` · 第 ${jumpPage()} 页` : ""}
+              跳转中{jumpPages() > 0 ? ` · 已加载 ${jumpPages()} 页` : ""}
+              {jumpElapsed() > 0 ? ` · ${jumpElapsed()}s` : ""}
             </span>
           </Show>
           <button
