@@ -897,6 +897,9 @@ function Rail(props) {
     const elapsedTimer = setInterval(() => {
       setJumpElapsed(Math.round((Date.now() - startedAt) / 1000))
     }, 500)
+    // Pages loaded so far, accumulated across chains (a new chain restarts
+    // the per-chain counter, the headline must not go backwards).
+    let chainBase = 0
     try {
       const deadline = Date.now() + JUMP_TOTAL_MS
       for (let chain = 0; chain < JUMP_ROUNDS && Date.now() < deadline; chain++) {
@@ -919,13 +922,16 @@ function Rail(props) {
         }
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         navTo(path, turn.id)
-        flash(`跳转中 · 已加载 ${jumpPages()} 页`, JUMP_TOTAL_MS)
+        flash(`跳转中 · 已加载 ${chainBase} 页`, JUMP_TOTAL_MS)
 
+        let chainPages = 0
         const remaining = Math.min(JUMP_CHAIN_MS, deadline - Date.now())
         const landed = await waitForRow(turn.id, token, remaining, (pages) => {
-          setJumpPages(pages)
-          flash(`跳转中 · 已加载 ${pages} 页`, JUMP_TOTAL_MS)
+          chainPages = pages
+          setJumpPages(chainBase + pages)
+          flash(`跳转中 · 已加载 ${chainBase + pages} 页`, JUMP_TOTAL_MS)
         })
+        chainBase += chainPages
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         if (landed) {
           const live = scroller() ?? sc
