@@ -6,7 +6,7 @@ import { Portal } from "solid-js/web"
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v21"
+const VERSION = "v22"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
@@ -24,12 +24,15 @@ const LIGHT_PAGE_SIZE = 50
 // to 12 times on its own. The plugin therefore does NOT poll the hash: it
 // sets it once and waits. JUMP_CHAIN_MS is how long a single chain may run,
 // JUMP_IDLE_MS how long the host may stay completely idle before the plugin
-// assumes the chain died and starts a new one.
+// assumes the chain died and starts a new one. Efficiency-first: the host
+// pages with a 2s cooldown, so 6s of total silence means the seek was
+// dropped (its machine starts inactive and ignores early seeks) - bounce
+// and re-engage instead of waiting longer.
 const JUMP_ROUNDS = 30
 const JUMP_TOTAL_MS = 45000
 const JUMP_CHAIN_MS = 20000
-const JUMP_IDLE_MS = 8000
-const JUMP_FIRST_IDLE_MS = 12000
+const JUMP_IDLE_MS = 6000
+const JUMP_FIRST_IDLE_MS = 6000
 const JUMP_TOGGLE_DWELL_MS = 220
 const SAME_TARGET_WINDOW_MS = 800
 
@@ -644,10 +647,12 @@ function Rail(props) {
         pendingBump = false
         scheduleLight()
       }
-      // Prewarm long sessions as soon as their full turn list has loaded, so
-      // the history is warm before the first click (not only on rail hover).
-      if (mode === "full" && !error && id === untrack(sessionID) && cache.size >= 15) {
-        setTimeout(() => maybePrewarm(), 1200)
+      // Prewarm EVERY session as soon as its full turn list has loaded - the
+      // host's seek machine drops seeks issued before the timeline is ready,
+      // and an 8-turn session used to hit exactly that window on first click
+      // (12s of dead air). Short sessions cost at most one extra host page.
+      if (mode === "full" && !error && id === untrack(sessionID) && cache.size >= 1) {
+        setTimeout(() => maybePrewarm(), 400)
       }
     }
   }
@@ -973,7 +978,13 @@ function Rail(props) {
   // does NOT resolve just because rows appeared: the host may still be
   // fetching the rest of the history for this target, and interrupting it
   // (by toggling the hash) is what made deep jumps crawl one page per click.
-  const waitForRow = (messageID, token, timeout, onPage) =>
+  //
+  // onKick covers the cold-start case: the host's seek machine starts
+  // inactive and DROPS a seek issued before the timeline is ready (worst on
+  // short sessions, which never used to prewarm). When nothing at all has
+  // happened for KICK_AFTER_MS, it is called once to bounce the hash and
+  // re-engage the host; then the normal idle limits apply.
+  const waitForRow = (messageID, token, timeout, onPage, onKick) =>
     new Promise((resolve) => {
       let done = false
       let observer
@@ -984,6 +995,8 @@ function Rail(props) {
       let lastSig = baseline
       let lastChange = started
       let pages = 0
+      let kicked = false
+      const KICK_AFTER_MS = 4000
       const finish = (row) => {
         if (done) return
         done = true
@@ -1015,6 +1028,14 @@ function Rail(props) {
         // patient - the initial fetch can take seconds, and bouncing the hash
         // then would abort it.
         const idleLimit = pages > 0 ? JUMP_IDLE_MS : JUMP_FIRST_IDLE_MS
+        // Cold start, nothing has EVER changed: a dropped seek. Kick the host
+        // once instead of burning the whole first-idle budget on dead air.
+        if (!kicked && onKick && baseline === "0" && now - lastChange > KICK_AFTER_MS) {
+          kicked = true
+          lastChange = now
+          onKick()
+          return
+        }
         if (now - lastChange > idleLimit) finish(null)
       }
       const existing = findRow(messageID)
@@ -1104,6 +1125,8 @@ function Rail(props) {
       // seek: just wait for the row to mount, then land. The header reads
       // "预热中 · 稍等一下" while we wait.
       if (warming()) {
+        // No cold-start kick here: the running prewarm owns the hash and has
+        // its own kick loop; competing toggles would fight it.
         const landed = await waitForRow(turn.id, token, 20000, (pages) => setJumpPages(pages))
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         if (landed) {
@@ -1151,11 +1174,25 @@ function Rail(props) {
 
         let chainPages = 0
         const remaining = Math.min(JUMP_CHAIN_MS, deadline - Date.now())
-        const landed = await waitForRow(turn.id, token, remaining, (pages) => {
-          chainPages = pages
-          // Progress is shown in the panel header, not in a toast.
-          setJumpPages(chainBase + pages)
-        })
+        const landed = await waitForRow(
+          turn.id,
+          token,
+          remaining,
+          (pages) => {
+            chainPages = pages
+            // Progress is shown in the panel header, not in a toast.
+            setJumpPages(chainBase + pages)
+          },
+          // Cold start: the host dropped our seek (its machine activates only
+          // after the timeline is ready). Bounce the hash through a mounted
+          // turn to re-engage it now instead of waiting out the idle budget.
+          () => {
+            const other = oldestLoadedTurn() ?? turns()[0]
+            if (other && other.id !== turn.id) {
+              navTo(path, other.id)
+            }
+          },
+        )
         chainBase += chainPages
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         if (landed) {
@@ -1230,13 +1267,14 @@ function Rail(props) {
     setWarming(false)
   }
 
-  // Prewarm once per session, when the user shows interest in the rail (hover
-  // or /turns). Long sessions only - short ones are already instant.
+  // Prewarm once per session, right after the turn list loads (or on hover /
+  // /turns). Every session gets it: the warm cost for a short session is one
+  // cheap host page, and it guarantees the first click lands instantly.
   const maybePrewarm = () => {
     const sid = sessionID()
     if (!sid || warming()) return
     if (warmedFor === sid) return
-    if (turns().length < 15) return
+    if (turns().length < 1) return
     void prewarm()
   }
 
@@ -1247,7 +1285,11 @@ function Rail(props) {
     const sid = sessionID()
     if (!path || !oldest || !sid) return
     // Already warm: the oldest turn is mounted, so the store has the history.
-    if (warmedFor === sid && findRow(oldest.id)) return
+    if (findRow(oldest.id)) {
+      warmedFor = sid
+      return
+    }
+    if (warmedFor === sid) return
     const token = ++warmToken
     const anchor = viewAnchor()
     const sc = scroller()
@@ -1261,7 +1303,7 @@ function Rail(props) {
       // the host goes silent, bounce the hash to re-engage it once it is ready.
       // If it never engages, bail fast (without marking warm) so clicks fall
       // back to a direct jump instead of all showing "预热中 · 稍等一下" for 2min.
-      const deadline = Date.now() + 60000
+      const deadline = Date.now() + 30000
       let lastSig = rowSignature()
       let lastChange = Date.now()
       let kicks = 0
@@ -1278,7 +1320,7 @@ function Rail(props) {
             lastSig = sig
             lastChange = now
             kicks = 0
-          } else if (now - lastChange > 5000) {
+          } else if (now - lastChange > 3000) {
             if (kicks >= 2) break // host never engaged: give up, stay un-warm
             // Re-engage: a repeated identical hash is ignored by the router, so
             // bounce through a mounted turn first, then back to the oldest.
@@ -1343,9 +1385,9 @@ function Rail(props) {
     const sid = sessionID()
     const count = turns().length
     const hot = warming()
-    if (!sid || count < 15 || hot || warmedFor === sid || warmBlockedFor === sid) return
+    if (!sid || count < 1 || hot || warmedFor === sid || warmBlockedFor === sid) return
     if (loadingActive || loadedFor !== sid) return
-    const timer = setTimeout(() => maybePrewarm(), 1200)
+    const timer = setTimeout(() => maybePrewarm(), 400)
     onCleanup(() => clearTimeout(timer))
   })
 
