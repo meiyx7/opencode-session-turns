@@ -1,6 +1,6 @@
 {
   "name": "opencode-timeline-gui",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "OpenCode Desktop 插件：在会话右缘列出每一轮用户提问，点击即可跳转到对应消息。A right-edge rail of user turns; click one to jump to that message. (formerly opencode-session-turns)",
   "type": "module",
   "license": "MIT",

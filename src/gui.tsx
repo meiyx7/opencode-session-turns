@@ -6,7 +6,7 @@ import { Portal } from "solid-js/web"
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v25"
+const VERSION = "v26"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
@@ -1097,6 +1097,16 @@ function Rail(props) {
     lastNavID = id
   }
 
+  // Navigates to the session WITHOUT a hash. The host ignores a hash value it
+  // already holds, and an intermediate "bounce" through another turn can be
+  // coalesced away when two clicks land close together - which left the jump
+  // re-sending the same ignored hash for 30s ("0% · 还需 ~1s · 31s").
+  // Clearing the hash first guarantees the next seek is a fresh value.
+  const navClear = (path) => {
+    clickRoute(path)
+    lastNavID = ""
+  }
+
   // Cheap fingerprint of the mounted timeline rows. Paging in older history
   // prepends rows, so a changed fingerprint means the host did real work and
   // the next hash toggle can be sent immediately.
@@ -1329,11 +1339,13 @@ function Rail(props) {
       setJumpProgress(Math.min(0.97, Math.max(0, 1 - remaining / this.startRemaining)))
       const perPage = Math.max(3, Math.min(40, this.turnsPerPage))
       const pagesLeft = Math.max(1, Math.ceil(remaining / perPage))
-      // Count DOWN between page landings. Before this the header froze on the
-      // last estimate until the next fingerprint change, so a 12s jump showed
-      // the same "还需 ~12s" at second 1 and second 11.
-      const spent = Date.now() - this.lastChange
-      const etaSec = Math.round((pagesLeft * this.pageMs - spent) / 1000)
+      // `sincePage` keeps growing while the host is stalled. Subtracting it
+      // from the whole projection drove the ETA to `max(1, negative)` = "还需
+      // ~1s" forever (the "0% · 还需 ~1s · 31s" header). Count the overshoot
+      // FORWARD instead: a stalled host now makes the estimate grow.
+      const sincePage = Date.now() - this.lastChange
+      const overrun = Math.max(0, sincePage - this.pageMs)
+      const etaSec = Math.round((pagesLeft * this.pageMs + overrun) / 1000)
       setJumpEta(Math.max(1, etaSec))
       return etaSec
     },
@@ -1453,17 +1465,14 @@ function Rail(props) {
         cancelWarm()
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         // The host may still have the prewarm's OLDEST-seek pending; the plugin
-        // cannot cancel it directly. A hash change is the only thing that
-        // resets the host's seek machine, so bounce through a mounted turn
-        // before asking for our target. Without this the first click after
-        // opening a session waited for the prewarm seek to drain (the
-        // "只有读秒、没有还需" 12s case).
-        const other = oldestLoadedTurn() ?? turns()[0]
-        if (other && other.id !== turn.id) {
-          navTo(path, other.id)
-          await sleep(JUMP_TOGGLE_DWELL_MS)
-          if (token !== jumpToken || sessionID() !== sessionAtJump) return
-        }
+        // cannot cancel it directly. Clearing the hash is the only thing that
+        // resets the host's seek machine. This also guarantees that the seek
+        // issued below is a fresh value even when the prewarm was already
+        // seeking the same turn - the duplicate-hash case that left jumps
+        // waiting at "0% · 还需 ~1s" for 30s.
+        navClear(path)
+        await sleep(JUMP_TOGGLE_DWELL_MS)
+        if (token !== jumpToken || sessionID() !== sessionAtJump) return
       }
 
       // Deep history, no prewarm. The host's own seek machine does the heavy
@@ -1482,15 +1491,11 @@ function Rail(props) {
 
         if (lastNavID === turn.id) {
           // The hash already points at the target and the host ignores a
-          // repeated hash value, so bounce through a mounted turn to force a
-          // fresh seek. This is the fallback path, not the normal one.
-          const other = oldestLoadedTurn() ?? turns()[0]
-          if (other) {
-            navTo(path, other.id)
-            // Let the host commit the intermediate hash before seeking back;
-            // too fast and both clicks collapse into the same target hash.
-            await sleep(JUMP_TOGGLE_DWELL_MS)
-          }
+          // repeated value, so clear it first to force a fresh seek. This is
+          // the fallback path, not the normal one.
+          navClear(path)
+          // Let the host commit the cleared route before seeking.
+          await sleep(JUMP_TOGGLE_DWELL_MS)
         }
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         // Sample the mounted range BEFORE issuing the seek: the host unmounts
@@ -1665,7 +1670,7 @@ function Rail(props) {
   // The guard runs from the scroll listener (synchronously, before paint) and
   // from rAF, so the host's seek is never actually rendered.
   const makeGuard = (targetID) => {
-    const state = { stopped: false, landed: false }
+    const state = { stopped: false, landed: false, seeked: false, top: scroller()?.scrollTop ?? 0 }
     const apply = () => {
       if (state.stopped) return
       const sc = scroller()
@@ -1673,12 +1678,22 @@ function Rail(props) {
       // Probe BEFORE restoring: restoring the viewport unmounts the row the
       // host just seeked to, so this is the only moment the mount is visible.
       if (targetID && !state.landed && findRow(targetID)) state.landed = true
+      // A host seek toward OLDER history decreases scrollTop; our own
+      // correction increases it. Direction tells them apart. This matters for
+      // short sessions: nothing has to be paged in, the host simply scrolls,
+      // and the target row may never survive a frame because the guard pins it
+      // back - so "the host moved toward the target" is the only success
+      // signal available there.
+      const top = sc.scrollTop
+      if (top < state.top - 24) state.seeked = true
+      state.top = top
       if (sc.scrollHeight - sc.scrollTop - sc.clientHeight > 1) sc.scrollTop = sc.scrollHeight
+      state.top = sc.scrollTop
     }
     const stop = () => {
       state.stopped = true
     }
-    return { apply, stop, landed: () => state.landed }
+    return { apply, stop, landed: () => state.landed, seeked: () => state.seeked }
   }
 
   const cancelWarm = () => {
@@ -1874,13 +1889,10 @@ function Rail(props) {
           if (progressed) break
           if (kicks >= kickBudget) break // host never engaged: give up, stay un-warm
           // Re-engage: a repeated identical hash is ignored by the router, so
-          // bounce through a mounted turn first, then back to the oldest.
-          const other = oldestLoadedTurn()
-          if (other && other.id !== oldest.id) {
-            navTo(path, other.id)
-            await sleep(JUMP_TOGGLE_DWELL_MS)
-            if (token !== warmToken) break
-          }
+          // clear it first, then seek to the oldest again.
+          navClear(path)
+          await sleep(JUMP_TOGGLE_DWELL_MS)
+          if (token !== warmToken) break
           navTo(path, oldest.id)
           lastChange = Date.now()
           kicks++
@@ -1889,9 +1901,10 @@ function Rail(props) {
       if (token !== warmToken) return
       // The host pages *toward* the seek target, which here is the oldest turn:
       // once it has paged at all and then gone quiet, the history it needed is
-      // in its store. Treat that as warm too - the alternative is retrying,
-      // which re-pins the viewport to the bottom for no extra pages.
-      const done = guard.landed() || progressed
+      // in its store. On a short session nothing is paged at all - the host
+      // just scrolls - so a seek toward the top counts too. Without that,
+      // short sessions could never prove themselves warm and kept retrying.
+      const done = guard.landed() || progressed || guard.seeked()
       // Final correction: the host left the viewport at the seek target.
       guard.apply()
       if (done) {
