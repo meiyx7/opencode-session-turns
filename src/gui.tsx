@@ -6,7 +6,7 @@ import { Portal } from "solid-js/web"
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v22"
+const VERSION = "v23"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
@@ -35,6 +35,15 @@ const JUMP_IDLE_MS = 6000
 const JUMP_FIRST_IDLE_MS = 6000
 const JUMP_TOGGLE_DWELL_MS = 220
 const SAME_TARGET_WINDOW_MS = 800
+
+// ETA estimation. The host's paging machine runs on a fixed cadence (a hard
+// 2s cooldown between pages, ~5 turns per page), and the plugin knows every
+// turn's index from the server-side list - so remaining time is computable:
+// remaining turns / measured turns-per-page x measured ms-per-page. Both
+// rates are measured live and converge as pages land; the defaults only
+// cover the first estimate.
+const PAGE_MS_DEFAULT = 2000
+const TURNS_PER_PAGE_DEFAULT = 5
 
 // Filled by Rail.load()/jump() so the command palette can report diagnostics.
 let lastTurnCount = 0
@@ -241,6 +250,7 @@ const CSS = `
   box-shadow: 0 8px 32px rgba(0,0,0,.28);
 }
 .sr-head {
+  position: relative;
   display: none;
   align-items: center;
   justify-content: space-between;
@@ -256,6 +266,37 @@ const CSS = `
   opacity: .95;
   color: rgba(255,170,60,.95);
   font-variant-numeric: tabular-nums;
+}
+/* determinate ETA bar (jumping/prewarming): sits under the header text */
+.sr-eta-bar {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 0;
+  height: 2px;
+  border-radius: 1px;
+  background: rgba(127,127,127,.18);
+  overflow: hidden;
+}
+.sr-eta-fill {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 1px;
+  background: rgba(255,170,60,.9);
+  transition: width .4s ease;
+}
+/* indeterminate shimmer while no target position is known yet */
+.sr-eta-bar[data-live="false"] .sr-eta-fill {
+  width: 30%;
+  animation: srSlide 1.2s ease-in-out infinite;
+}
+@keyframes srSlide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(430%); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sr-eta-bar[data-live="false"] .sr-eta-fill { animation: none; width: 100%; opacity: .4; }
 }
 .sr-head-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
 .sr-iconbtn {
@@ -549,6 +590,10 @@ function Rail(props) {
   const [jumpPages, setJumpPages] = createSignal(0)
   const [jumpElapsed, setJumpElapsed] = createSignal(0)
   const [jumpChain, setJumpChain] = createSignal(0)
+  // Live ETA for the running jump/prewarm, in seconds (null = not computable).
+  const [jumpEta, setJumpEta] = createSignal(null)
+  // Progress toward the target, 0..1 (null = target position unknown).
+  const [jumpProgress, setJumpProgress] = createSignal(null)
   const [busyID, setBusyID] = createSignal("")
   // True while a click is waiting for the background prewarm to page its target
   // in (header reads "预热中 · 稍等一下" instead of "加载历史中").
@@ -592,6 +637,23 @@ function Rail(props) {
     return await ctx.client.message.list(params)
   }
 
+  // Oldest-turn probe: one cheap `order:"asc", limit:1` request that lets
+  // prewarming start immediately on session open, without waiting for the
+  // full desc list to walk every page (the oldest turn is on the LAST page).
+  // Fired once per full load, in parallel with the list walk.
+  let probeFor = ""
+  let oldestProbe = ""
+  const probeOldest = async (id) => {
+    if (probeFor === id) return oldestProbe
+    probeFor = id
+    oldestProbe = ""
+    try {
+      const res = await ctx.client.message.list({ sessionID: id, type: "user", limit: 1, order: "asc" })
+      oldestProbe = res?.data?.[0]?.id ?? ""
+    } catch {}
+    return oldestProbe
+  }
+
   const load = async (id, mode) => {
     const token = ++loadToken
     loadingActive = true
@@ -602,6 +664,9 @@ function Rail(props) {
       warmBlockedFor = ""
     }
     let error = ""
+    // Fire the oldest-turn probe immediately in full mode (parallel with the
+    // list walk) so prewarm can start before the list finishes.
+    if (mode === "full") void probeOldest(id)
     try {
       let cursor
       const pages = mode === "full" ? FULL_PAGE_LIMIT : 1
@@ -651,8 +716,19 @@ function Rail(props) {
       // host's seek machine drops seeks issued before the timeline is ready,
       // and an 8-turn session used to hit exactly that window on first click
       // (12s of dead air). Short sessions cost at most one extra host page.
+      // With the asc probe, start as soon as the oldest turn id is known -
+      // even if the desc list walk is still in flight (its cache keeps
+      // filling via the event-driven light refresh).
       if (mode === "full" && !error && id === untrack(sessionID) && cache.size >= 1) {
         setTimeout(() => maybePrewarm(), 400)
+      } else if (mode === "full" && !error && id === untrack(sessionID)) {
+        // List walk still needed the first page? probeOldest may already have
+        // resolved; give prewarm a chance as soon as both are ready.
+        void probeOldest(id).then((oldest) => {
+          if (oldest && id === untrack(sessionID) && !warmedFor && !warmBlockedFor) {
+            setTimeout(() => maybePrewarm(), 400)
+          }
+        })
       }
     }
   }
@@ -1052,9 +1128,111 @@ function Rail(props) {
     setJumpPages(0)
     setJumpElapsed(0)
     setJumpChain(0)
+    setJumpEta(null)
+    setJumpProgress(null)
     setBusyID("")
     setWaitWarm(false)
     flash("已取消跳转")
+  }
+
+  // ---- ETA estimator -------------------------------------------------------
+  // Feeds on the same signal the jump loop already watches: every change of
+  // the mounted-row fingerprint is one host page landing. From the page
+  // cadence it projects the remaining time to a target index in the turn
+  // list. Rough by nature (the host exposes no store progress), but it
+  // converges: after 2-3 pages the two rates are measured, not assumed.
+  const eta = {
+    // Turn id the estimate points at + its 0-based index in the full list.
+    targetID: "",
+    targetIndex: 0,
+    total: 0,
+    startedAt: 0,
+    lastSig: "",
+    lastChange: 0,
+    pages: 0,
+    pageMs: PAGE_MS_DEFAULT,
+    turnsPerPage: TURNS_PER_PAGE_DEFAULT,
+    lastPages: 0,
+    reset(targetID, targetIndex, total) {
+      this.targetID = targetID
+      this.targetIndex = targetIndex
+      this.total = total
+      this.startedAt = Date.now()
+      this.lastSig = rowSignature()
+      this.lastChange = this.startedAt
+      this.pages = 0
+      this.lastPages = 0
+      const first = cache.get(targetID)
+      // Turns the host must page through: from the currently-oldest mounted
+      // row down to the target. Until the first page lands, approximate the
+      // mounted depth as "a screenful", i.e. assume the host starts near the
+      // newest messages (the common case).
+      let mountedOldestIndex = Math.max(0, this.total - TURNS_PER_PAGE_DEFAULT)
+      for (const t of untrack(turns)) {
+        if (findRow(t.id)) {
+          mountedOldestIndex = cache.get(t.id)?.created ? untrack(turns).indexOf(t) : mountedOldestIndex
+          break
+        }
+      }
+      this.remainingTurns = Math.max(0, targetIndex - mountedOldestIndex)
+    },
+    // Called on every fingerprint change (= one page landed).
+    page(now) {
+      this.pages++
+      if (this.lastChange && now - this.lastChange > 200) {
+        // Exponential moving average: recent pages weigh more; the host's
+        // 2s cooldown makes the first sample dominate early, later samples
+        // smooth jitter.
+        const sample = now - this.lastChange
+        this.pageMs = this.pageMs === PAGE_MS_DEFAULT ? sample : Math.round(this.pageMs * 0.7 + sample * 0.3)
+      }
+      this.lastChange = now
+    },
+    // Recompute remaining turns from what is actually mounted now.
+    update() {
+      if (!this.targetID) return null
+      const list = untrack(turns)
+      let mountedOldestIndex = -1
+      for (let i = 0; i < list.length; i++) {
+        if (findRow(list[i].id)) {
+          mountedOldestIndex = i
+          break
+        }
+      }
+      if (mountedOldestIndex < 0) return null
+      this.remainingTurns = Math.max(0, this.targetIndex - mountedOldestIndex)
+      const perPage = Math.max(1, this.turnsPerPage)
+      const remainingPages = Math.ceil(this.remainingTurns / perPage)
+      const totalTurns = Math.max(this.total, 1)
+      setJumpProgress(Math.min(1, Math.max(0, 1 - this.remainingTurns / Math.max(1, this.targetIndex + perPage))))
+      if (this.remainingTurns === 0) {
+        setJumpEta(0)
+        return 0
+      }
+      const etaSec = Math.round((remainingPages * this.pageMs) / 1000)
+      setJumpEta(etaSec)
+      return etaSec
+    },
+    remainingTurns: 0,
+  }
+
+  // Starts (or retargets) the estimator for a jump/prewarm.
+  const etaStart = (targetID) => {
+    const list = untrack(turns)
+    const index = list.findIndex((t) => t.id === targetID)
+    if (index < 0) return
+    eta.reset(targetID, index, list.length)
+    eta.update()
+  }
+
+  const etaPage = () => {
+    eta.page(Date.now())
+    eta.update()
+  }
+
+  const etaStop = () => {
+    setJumpEta(null)
+    setJumpProgress(null)
   }
 
   const jump = async (turn) => {
@@ -1127,7 +1305,11 @@ function Rail(props) {
       if (warming()) {
         // No cold-start kick here: the running prewarm owns the hash and has
         // its own kick loop; competing toggles would fight it.
-        const landed = await waitForRow(turn.id, token, 20000, (pages) => setJumpPages(pages))
+        etaStart(turn.id)
+        const landed = await waitForRow(turn.id, token, 20000, (pages) => {
+          setJumpPages(pages)
+          if (pages > eta.lastPages) etaPage()
+        })
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
         if (landed) {
           cancelWarm()
@@ -1174,6 +1356,7 @@ function Rail(props) {
 
         let chainPages = 0
         const remaining = Math.min(JUMP_CHAIN_MS, deadline - Date.now())
+        if (chain === 0) etaStart(turn.id)
         const landed = await waitForRow(
           turn.id,
           token,
@@ -1182,6 +1365,8 @@ function Rail(props) {
             chainPages = pages
             // Progress is shown in the panel header, not in a toast.
             setJumpPages(chainBase + pages)
+            // One fingerprint change == one page landed: feed the ETA.
+            if (pages > eta.lastPages) etaPage()
           },
           // Cold start: the host dropped our seek (its machine activates only
           // after the timeline is ready). Bounce the hash through a mounted
@@ -1207,6 +1392,7 @@ function Rail(props) {
       if (token === jumpToken) flash(`未能定位 · ${diagnostics(ctx)}`)
     } finally {
       clearInterval(elapsedTimer)
+      etaStop()
       // A newer jump owns the signals when the token moved on.
       if (token === jumpToken) {
         setJumping(false)
@@ -1265,6 +1451,7 @@ function Rail(props) {
   const cancelWarm = () => {
     warmToken++
     setWarming(false)
+    if (!jumping()) etaStop()
   }
 
   // Prewarm once per session, right after the turn list loads (or on hover /
@@ -1274,16 +1461,22 @@ function Rail(props) {
     const sid = sessionID()
     if (!sid || warming()) return
     if (warmedFor === sid) return
-    if (turns().length < 1) return
+    if (turns().length < 1 && !oldestProbe) return
     void prewarm()
   }
 
   const prewarm = async () => {
     if (warming()) return
     const path = routePath(ctx)
-    const oldest = turns()[0]
     const sid = sessionID()
-    if (!path || !oldest || !sid) return
+    if (!path || !sid) return
+    // Target: the oldest known turn. Prefer the full list's head; fall back
+    // to the asc probe so prewarm can run before the list walk finishes.
+    let oldest = turns()[0]
+    if (!oldest && oldestProbe) {
+      oldest = { id: oldestProbe, created: 0, text: "" }
+    }
+    if (!oldest) return
     // Already warm: the oldest turn is mounted, so the store has the history.
     if (findRow(oldest.id)) {
       warmedFor = sid
@@ -1295,6 +1488,9 @@ function Rail(props) {
     const sc = scroller()
     const wasAtBottom = sc ? sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 32 : true
     setWarming(true)
+    // Surface the warm-up in the same progress header a jump uses, so an
+    // early click shows a live estimate instead of just "稍等一下".
+    etaStart(oldest.id)
     try {
       navTo(path, oldest.id)
       // The host's seek machine starts inactive and DROPS a seek issued before
@@ -1320,8 +1516,9 @@ function Rail(props) {
             lastSig = sig
             lastChange = now
             kicks = 0
+            etaPage()
           } else if (now - lastChange > 3000) {
-            if (kicks >= 2) break // host never engaged: give up, stay un-warm
+            if (kicks >= 4) break // host never engaged: give up, stay un-warm
             // Re-engage: a repeated identical hash is ignored by the router, so
             // bounce through a mounted turn first, then back to the oldest.
             const other = oldestLoadedTurn()
@@ -1354,7 +1551,11 @@ function Rail(props) {
       }
       // Silent on success: prewarming is an implementation detail.
     } finally {
-      if (token === warmToken) setWarming(false)
+      if (token === warmToken) {
+        setWarming(false)
+        // Keep a jump's ETA alive if one is riding the prewarm; otherwise clear.
+        if (!jumping()) etaStop()
+      }
     }
   }
 
@@ -1371,6 +1572,8 @@ function Rail(props) {
     setJumpPages(0)
     setJumpElapsed(0)
     setJumpChain(0)
+    setJumpEta(null)
+    setJumpProgress(null)
     setBusyID("")
     setWaitWarm(false)
   })
@@ -1497,9 +1700,16 @@ function Rail(props) {
             }
           >
             <span class="sr-title sr-progress">
-              {waitWarm() ? "预热中 · 稍等一下" : "加载历史中"}
+              {waitWarm() ? "预热中" : "加载历史中"}
+              {jumpProgress() != null ? ` · ${Math.round(jumpProgress() * 100)}%` : ""}
+              {jumpEta() != null ? ` · 还需 ~${jumpEta() > 0 ? jumpEta() : "<1"}s` : ""}
               {jumpPages() > 0 ? ` · ${jumpPages()} 页` : ""}
               {jumpElapsed() > 0 ? ` · ${jumpElapsed()}s` : ""}
+            </span>
+            {/* Thin determinate bar under the header; indeterminate shimmer
+                while the ETA has no target position yet. */}
+            <span class="sr-eta-bar" data-live={jumpProgress() != null ? "true" : "false"}>
+              <span class="sr-eta-fill" style={{ width: jumpProgress() != null ? `${Math.round(jumpProgress() * 100)}%` : "" }} />
             </span>
           </Show>
           <span class="sr-head-actions">
