@@ -6,7 +6,7 @@ import { Portal } from "solid-js/web"
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v24"
+const VERSION = "v25"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
@@ -1134,6 +1134,10 @@ function Rail(props) {
       let lastChange = started
       let pages = 0
       let kicked = false
+      // The cold-start kick bounces the hash, which changes the mounted rows
+      // without the host paging anything. Counting that as a page corrupted
+      // both the page counter and the ETA cadence, so skip the next change.
+      let skipNextPage = false
       const KICK_AFTER_MS = 4000
       const finish = (row) => {
         if (done) return
@@ -1157,6 +1161,10 @@ function Rail(props) {
         if (sig !== lastSig) {
           lastSig = sig
           lastChange = now
+          if (skipNextPage) {
+            skipNextPage = false
+            return
+          }
           pages++
           onPage?.(pages)
           return
@@ -1171,6 +1179,7 @@ function Rail(props) {
         if (!kicked && onKick && baseline === "0" && now - lastChange > KICK_AFTER_MS) {
           kicked = true
           lastChange = now
+          skipNextPage = true
           onKick()
           return
         }
@@ -1223,6 +1232,10 @@ function Rail(props) {
     startRemaining: 1,
     // Oldest mounted index seen at the last update, to measure turns/page.
     lastMounted: -1,
+    // Set when the prewarm already pulled the whole history into the host's
+    // store. The seek then only has to SCROLL - no page cadence applies, so
+    // projecting from turns/page would announce a huge ETA for an instant jump.
+    warm: false,
 
     // Index of the oldest turn currently mounted in the timeline, or -1.
     mountedOldest() {
@@ -1242,18 +1255,29 @@ function Rail(props) {
       this.targetID = targetID
       this.targetIndex = targetIndex
       this.total = total
+      this.warm = false
       this.startedAt = Date.now()
       this.lastChange = this.startedAt
       this.pages = 0
       this.lastMounted = this.mountedOldest()
+      // The host tears its timeline down for a moment when the router starts
+      // seeking, so the mounted range is often unknown exactly at jump start.
+      // `mountedOldest()` returning -1 used to make `remaining()` null, which
+      // blanked the ETA for the whole jump (only the elapsed clock showed).
+      // Assume a screenful above the newest turn instead: correct whenever the
+      // user was at the bottom, and always gives an immediate estimate.
+      if (this.lastMounted < 0) {
+        this.lastMounted = Math.max(0, this.total - TURNS_PER_PAGE_DEFAULT)
+      }
       const start = this.remaining(this.lastMounted)
-      // Until a row is mounted the depth is unknown: assume a screenful so the
-      // first estimate is not wildly optimistic.
-      this.startRemaining = Math.max(1, start ?? TURNS_PER_PAGE_DEFAULT)
+      this.startRemaining = Math.max(1, start ?? 1)
     },
     // Called on every fingerprint change (= one page landed).
     page(now) {
       this.pages++
+      // A page landing proves the store was NOT complete: drop the warm hint
+      // so the measured cadence takes over from here.
+      this.warm = false
       if (this.lastChange && now - this.lastChange > 200) {
         // Exponential moving average: recent pages weigh more; the host's
         // 2s cooldown makes the first sample dominate early, later samples
@@ -1266,34 +1290,50 @@ function Rail(props) {
     // Recompute remaining turns from what is actually mounted now.
     update() {
       if (!this.targetID) return null
-      const mounted = this.mountedOldest()
+      // While the host is navigating it may unmount every row for a moment.
+      // Fall back to the last known range (or a screenful from the newest
+      // turn) instead of returning null, which used to blank the ETA.
+      let mounted = this.mountedOldest()
+      if (mounted < 0) mounted = this.lastMounted
+      if (mounted < 0) mounted = Math.max(0, this.total - TURNS_PER_PAGE_DEFAULT)
       const remaining = this.remaining(mounted)
       if (remaining == null) return null
       // A page landing moves the mounted range: measure turns per page live so
       // the projection stops relying on the default.
       if (mounted >= 0 && this.lastMounted >= 0 && mounted < this.lastMounted) {
         const sample = this.lastMounted - mounted
-        this.turnsPerPage =
-          this.pages <= 1 ? sample : Math.round(this.turnsPerPage * 0.6 + sample * 0.4)
+        // A sample of 1 is almost always a virtual-list artifact, not a host
+        // page. Letting it through collapsed turnsPerPage to 1 and made the
+        // ETA explode ("还需 ~120s" for a few seconds of paging).
+        if (sample >= 2) {
+          this.turnsPerPage =
+            this.pages <= 1 ? sample : Math.round(this.turnsPerPage * 0.6 + sample * 0.4)
+        }
         this.lastMounted = mounted
       }
       this.startRemaining = Math.max(this.startRemaining, remaining)
-      // 100% is only honest once the row is actually on screen. "No paging
-      // needed" means the host only has to scroll, which we cannot measure -
-      // report that as indeterminate instead of a fake 100%.
+      // 100% is only honest once the row is actually on screen.
       if (findRow(this.targetID)) {
         setJumpProgress(1)
         setJumpEta(0)
         return 0
       }
-      if (remaining === 0) {
-        setJumpProgress(null)
-        setJumpEta(null)
-        return null
+      if (this.warm) {
+        // The prewarm already loaded the whole history into the host's store:
+        // this seek is a plain scroll, so report a short ETA instead of the
+        // "还需 ~60s" that a turns/page projection would announce.
+        setJumpProgress(0.9)
+        setJumpEta(1)
+        return 1
       }
       setJumpProgress(Math.min(0.97, Math.max(0, 1 - remaining / this.startRemaining)))
-      const perPage = Math.max(1, this.turnsPerPage)
-      const etaSec = Math.round((Math.ceil(remaining / perPage) * this.pageMs) / 1000)
+      const perPage = Math.max(3, Math.min(40, this.turnsPerPage))
+      const pagesLeft = Math.max(1, Math.ceil(remaining / perPage))
+      // Count DOWN between page landings. Before this the header froze on the
+      // last estimate until the next fingerprint change, so a 12s jump showed
+      // the same "还需 ~12s" at second 1 and second 11.
+      const spent = Date.now() - this.lastChange
+      const etaSec = Math.round((pagesLeft * this.pageMs - spent) / 1000)
       setJumpEta(Math.max(1, etaSec))
       return etaSec
     },
@@ -1301,11 +1341,15 @@ function Rail(props) {
 
   // Starts (or retargets) the estimator for a jump.
   //
+  // `warm` says the prewarm already loaded the whole history into the host's
+  // store, so the seek is a scroll, not paging: the ETA must not be projected
+  // from the paging cadence (that produced a huge number for an instant jump).
+  //
   // The target must be a real index in the FULL turn list. If it is not (e.g.
   // the list walk has not finished yet), clear the estimate instead of leaving
   // the PREVIOUS target's numbers on screen - that stale state is how a
   // 7-turn session ended up showing "100% · 还需 <1s" forever.
-  const etaStart = (targetID) => {
+  const etaStart = (targetID, warm) => {
     const list = untrack(turns)
     const index = list.findIndex((t) => t.id === targetID)
     if (index < 0) {
@@ -1314,6 +1358,7 @@ function Rail(props) {
       return
     }
     eta.reset(targetID, index, list.length)
+    eta.warm = !!warm
     eta.update()
   }
 
@@ -1323,6 +1368,9 @@ function Rail(props) {
   }
 
   const etaStop = () => {
+    // Also drop the target: a stray update (e.g. from the 500ms jump timer)
+    // must not resurrect an estimate for a finished/cancelled jump.
+    eta.targetID = ""
     setJumpEta(null)
     setJumpProgress(null)
   }
@@ -1388,6 +1436,8 @@ function Rail(props) {
     const startedAt = Date.now()
     const elapsedTimer = setInterval(() => {
       setJumpElapsed(Math.round((Date.now() - startedAt) / 1000))
+      // Keep the ETA counting down even while no page lands (see update()).
+      eta.update()
     }, 500)
     // Pages loaded so far, accumulated across chains (a new chain restarts
     // the per-chain counter, the headline must not go backwards).
@@ -1402,6 +1452,18 @@ function Rail(props) {
       if (warming()) {
         cancelWarm()
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
+        // The host may still have the prewarm's OLDEST-seek pending; the plugin
+        // cannot cancel it directly. A hash change is the only thing that
+        // resets the host's seek machine, so bounce through a mounted turn
+        // before asking for our target. Without this the first click after
+        // opening a session waited for the prewarm seek to drain (the
+        // "只有读秒、没有还需" 12s case).
+        const other = oldestLoadedTurn() ?? turns()[0]
+        if (other && other.id !== turn.id) {
+          navTo(path, other.id)
+          await sleep(JUMP_TOGGLE_DWELL_MS)
+          if (token !== jumpToken || sessionID() !== sessionAtJump) return
+        }
       }
 
       // Deep history, no prewarm. The host's own seek machine does the heavy
@@ -1431,11 +1493,14 @@ function Rail(props) {
           }
         }
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
+        // Sample the mounted range BEFORE issuing the seek: the host unmounts
+        // rows as soon as it starts navigating, and the initial estimate needs
+        // the pre-jump position to know how deep the target is.
+        if (chain === 0) etaStart(turn.id, warmedFor === sessionAtJump)
         navTo(path, turn.id)
 
         let chainPages = 0
         const remaining = Math.min(JUMP_CHAIN_MS, deadline - Date.now())
-        if (chain === 0) etaStart(turn.id)
         const landed = await waitForRow(
           turn.id,
           token,
