@@ -6,7 +6,7 @@ import { Portal } from "solid-js/web"
 // constants / helpers
 // ---------------------------------------------------------------------------
 
-const VERSION = "v23"
+const VERSION = "v24"
 const HASH_PREFIX = "message-"
 const DIAG_EVENT = "session-turns:diag"
 const OPEN_EVENT = "session-turns:open"
@@ -35,6 +35,14 @@ const JUMP_IDLE_MS = 6000
 const JUMP_FIRST_IDLE_MS = 6000
 const JUMP_TOGGLE_DWELL_MS = 220
 const SAME_TARGET_WINDOW_MS = 800
+
+// Prewarm politeness. Prewarming asks the host to seek the oldest message, so
+// the host moves the scroll position; the plugin puts it back every frame, but
+// only while nobody else is using the viewport.
+const USER_IDLE_MS = 8000 // no human input for this long => prewarm may run
+const EVENT_QUIET_MS = 1200 // an incoming message means the session is in use
+const WARM_RETRY_WINDOW_MS = 120000 // auto-retry budget after a session opens
+const WARM_RETRY_DELAY_MS = 1500
 
 // ETA estimation. The host's paging machine runs on a fixed cadence (a hard
 // 2s cooldown between pages, ~5 turns per page), and the plugin knows every
@@ -595,9 +603,6 @@ function Rail(props) {
   // Progress toward the target, 0..1 (null = target position unknown).
   const [jumpProgress, setJumpProgress] = createSignal(null)
   const [busyID, setBusyID] = createSignal("")
-  // True while a click is waiting for the background prewarm to page its target
-  // in (header reads "预热中 · 稍等一下" instead of "加载历史中").
-  const [waitWarm, setWaitWarm] = createSignal(false)
 
   // ---- turn cache ---------------------------------------------------------
   // Object identity is kept stable across refreshes so Solid's <For> reuses
@@ -608,6 +613,26 @@ function Rail(props) {
   let pendingBump = false
   let loadedFor = ""
   let lightTimer
+  // Viewport-intent bookkeeping (see "user viewport intent" below). Prewarm
+  // drives the host's seek machine, which moves the scroll position; it may
+  // only do that while nobody else is using the viewport, so these record when
+  // the human last drove it and when the host last pushed a message event.
+  let userActiveUntil = 0
+  let pointerHeld = false
+  let pointerHeldAt = 0
+  let lastEventAt = 0
+
+  // Prewarm bookkeeping. Declared up here because load() resets it, and load()
+  // can run before the prewarm section below is reached.
+  let warmToken = 0
+  let warmedFor = ""
+  // Set when a prewarm gave up without reaching the oldest turn (the host never
+  // engaged). The auto-resume effect must not retry it in a loop; an explicit
+  // hover or a fresh full load still may.
+  let warmBlockedFor = ""
+  let warmRetryTimer
+  let warmRetryUntil = 0
+  let warmFailures = 0
 
   const sessionID = () => props.session()?.id
 
@@ -643,16 +668,30 @@ function Rail(props) {
   // Fired once per full load, in parallel with the list walk.
   let probeFor = ""
   let oldestProbe = ""
+  let probePromise = null
   const probeOldest = async (id) => {
-    if (probeFor === id) return oldestProbe
+    // A second call while the first is still in flight must JOIN it, not
+    // return the (still empty) result - otherwise every caller after the first
+    // sees "no oldest turn" and the early-warm path never fires.
+    if (probeFor === id) return probePromise ?? oldestProbe
     probeFor = id
     oldestProbe = ""
-    try {
-      const res = await ctx.client.message.list({ sessionID: id, type: "user", limit: 1, order: "asc" })
-      oldestProbe = res?.data?.[0]?.id ?? ""
-    } catch {}
-    return oldestProbe
+    probePromise = (async () => {
+      try {
+        const res = await ctx.client.message.list({ sessionID: id, type: "user", limit: 1, order: "asc" })
+        // A newer probe (session switch) owns the slot now.
+        if (probeFor === id) oldestProbe = res?.data?.[0]?.id ?? ""
+      } catch {}
+      return oldestProbe
+    })()
+    return probePromise
   }
+
+  // Session whose turn list was walked to the end. Until then `turns()[0]` is
+  // merely the oldest turn of the pages fetched SO FAR, so treating it as "the
+  // oldest turn" makes prewarm target a message that is not actually the head
+  // of the history (and lets a short-looking list report "already warm").
+  let listCompleteFor = ""
 
   const load = async (id, mode) => {
     const token = ++loadToken
@@ -662,6 +701,10 @@ function Rail(props) {
     if (mode === "full") {
       warmedFor = ""
       warmBlockedFor = ""
+      warmFailures = 0
+      // Re-open a retry window: the timeline may not be mounted yet, and
+      // maybePrewarm() refuses to seek before it is (the host drops such seeks).
+      warmRetryUntil = Date.now() + WARM_RETRY_WINDOW_MS
     }
     let error = ""
     // Fire the oldest-turn probe immediately in full mode (parallel with the
@@ -699,14 +742,22 @@ function Rail(props) {
         // popping in all at once after every page has been fetched.
         publish()
         const next = response?.cursor?.next
+        // The walk reached the end of the history: `turns()[0]` is now the real
+        // oldest turn and prewarm may use it as its target.
+        if (mode === "full" && (!next || fresh === 0)) listCompleteFor = id
         if (!next || fresh === 0) break
         cursor = next
       }
     } finally {
-      loadingActive = false
-      loadedFor = id
-      lastNote = error
-      setNote(cache.size === 0 ? error || "暂无用户消息" : "")
+      // A newer load (session switch / shutdown reload) owns the shared state
+      // now. Writing `loadedFor`/`note` here would pin them to the OLD session
+      // and make every later prewarm/resume guard fail on a stale id.
+      if (token === loadToken) {
+        loadingActive = false
+        loadedFor = id
+        lastNote = error
+        setNote(cache.size === 0 ? error || "暂无用户消息" : "")
+      }
       // A message arrived while a full load was running: catch up now.
       if (pendingBump) {
         pendingBump = false
@@ -759,6 +810,11 @@ function Rail(props) {
 
   const handleEvent = (event) => {
     const type = event?.type
+    if (type === "message.updated" || type === "message.removed") {
+      // Message traffic in the *current* session means it is in use: prewarm
+      // must not move the viewport under an active conversation.
+      if (event?.data?.sessionID === untrack(sessionID)) lastEventAt = Date.now()
+    }
     if (type === "message.updated") {
       const data = event?.data ?? {}
       const info = data.info
@@ -811,6 +867,8 @@ function Rail(props) {
       stopped = true
       clearTimeout(retryTimer)
       if (lightTimer) clearTimeout(lightTimer)
+      if (warmRetryTimer) clearTimeout(warmRetryTimer)
+      warmRetryTimer = undefined
     })
   })
 
@@ -1004,6 +1062,10 @@ function Rail(props) {
   let jumpToken = 0
   let lastJumpAt = 0
   let lastJumpTurnID = ""
+  // After any navigation the host is scrolling/seeking; a prewarm must not
+  // steal the hash back during that window (it would cancel the seek and the
+  // viewport would snap back - the "jitter" symptom).
+  let jumpQuietUntil = 0
 
   // Brief highlight on the message bubble. The timeline row spans the whole
   // width, so tinting it looks like a stray orange band. The visible bubble is
@@ -1131,50 +1193,63 @@ function Rail(props) {
     setJumpEta(null)
     setJumpProgress(null)
     setBusyID("")
-    setWaitWarm(false)
     flash("已取消跳转")
   }
 
   // ---- ETA estimator -------------------------------------------------------
-  // Feeds on the same signal the jump loop already watches: every change of
-  // the mounted-row fingerprint is one host page landing. From the page
-  // cadence it projects the remaining time to a target index in the turn
-  // list. Rough by nature (the host exposes no store progress), but it
-  // converges: after 2-3 pages the two rates are measured, not assumed.
+  // Used ONLY for user-initiated jumps, where the host really does move the
+  // viewport through the history: every change of the mounted-row fingerprint
+  // is one host page landing, and from that cadence the remaining time to the
+  // target index can be projected. Rough by nature (the host exposes no store
+  // progress), but it converges: after 2-3 pages the rates are measured.
+  //
+  // IMPORTANT: "remaining" is the DISTANCE between the target index and the
+  // oldest mounted index, never a signed difference. The old code compared
+  // them as `target - mounted`; for a target older than what is mounted that
+  // went negative, clamped to 0, and the header proudly reported
+  // "100% · 还需 <1s" while the host was still paging.
   const eta = {
     // Turn id the estimate points at + its 0-based index in the full list.
     targetID: "",
     targetIndex: 0,
     total: 0,
     startedAt: 0,
-    lastSig: "",
     lastChange: 0,
     pages: 0,
     pageMs: PAGE_MS_DEFAULT,
     turnsPerPage: TURNS_PER_PAGE_DEFAULT,
-    lastPages: 0,
+    // Distance at the start of this estimate: the denominator of the progress
+    // bar. It never grows, so the bar can never go backwards.
+    startRemaining: 1,
+    // Oldest mounted index seen at the last update, to measure turns/page.
+    lastMounted: -1,
+
+    // Index of the oldest turn currently mounted in the timeline, or -1.
+    mountedOldest() {
+      const list = untrack(turns)
+      for (let i = 0; i < list.length; i++) if (findRow(list[i].id)) return i
+      return -1
+    },
+    // Turns that still separate the mounted range from the target. A target
+    // newer than the mounted range needs no paging at all (the host already
+    // holds newer messages and merely scrolls), so it is 0.
+    remaining(mountedOldest) {
+      if (mountedOldest < 0) return null
+      if (this.targetIndex >= mountedOldest) return 0
+      return mountedOldest - this.targetIndex
+    },
     reset(targetID, targetIndex, total) {
       this.targetID = targetID
       this.targetIndex = targetIndex
       this.total = total
       this.startedAt = Date.now()
-      this.lastSig = rowSignature()
       this.lastChange = this.startedAt
       this.pages = 0
-      this.lastPages = 0
-      const first = cache.get(targetID)
-      // Turns the host must page through: from the currently-oldest mounted
-      // row down to the target. Until the first page lands, approximate the
-      // mounted depth as "a screenful", i.e. assume the host starts near the
-      // newest messages (the common case).
-      let mountedOldestIndex = Math.max(0, this.total - TURNS_PER_PAGE_DEFAULT)
-      for (const t of untrack(turns)) {
-        if (findRow(t.id)) {
-          mountedOldestIndex = cache.get(t.id)?.created ? untrack(turns).indexOf(t) : mountedOldestIndex
-          break
-        }
-      }
-      this.remainingTurns = Math.max(0, targetIndex - mountedOldestIndex)
+      this.lastMounted = this.mountedOldest()
+      const start = this.remaining(this.lastMounted)
+      // Until a row is mounted the depth is unknown: assume a screenful so the
+      // first estimate is not wildly optimistic.
+      this.startRemaining = Math.max(1, start ?? TURNS_PER_PAGE_DEFAULT)
     },
     // Called on every fingerprint change (= one page landed).
     page(now) {
@@ -1184,43 +1259,60 @@ function Rail(props) {
         // 2s cooldown makes the first sample dominate early, later samples
         // smooth jitter.
         const sample = now - this.lastChange
-        this.pageMs = this.pageMs === PAGE_MS_DEFAULT ? sample : Math.round(this.pageMs * 0.7 + sample * 0.3)
+        this.pageMs = this.pages === 1 ? sample : Math.round(this.pageMs * 0.7 + sample * 0.3)
       }
       this.lastChange = now
     },
     // Recompute remaining turns from what is actually mounted now.
     update() {
       if (!this.targetID) return null
-      const list = untrack(turns)
-      let mountedOldestIndex = -1
-      for (let i = 0; i < list.length; i++) {
-        if (findRow(list[i].id)) {
-          mountedOldestIndex = i
-          break
-        }
+      const mounted = this.mountedOldest()
+      const remaining = this.remaining(mounted)
+      if (remaining == null) return null
+      // A page landing moves the mounted range: measure turns per page live so
+      // the projection stops relying on the default.
+      if (mounted >= 0 && this.lastMounted >= 0 && mounted < this.lastMounted) {
+        const sample = this.lastMounted - mounted
+        this.turnsPerPage =
+          this.pages <= 1 ? sample : Math.round(this.turnsPerPage * 0.6 + sample * 0.4)
+        this.lastMounted = mounted
       }
-      if (mountedOldestIndex < 0) return null
-      this.remainingTurns = Math.max(0, this.targetIndex - mountedOldestIndex)
-      const perPage = Math.max(1, this.turnsPerPage)
-      const remainingPages = Math.ceil(this.remainingTurns / perPage)
-      const totalTurns = Math.max(this.total, 1)
-      setJumpProgress(Math.min(1, Math.max(0, 1 - this.remainingTurns / Math.max(1, this.targetIndex + perPage))))
-      if (this.remainingTurns === 0) {
+      this.startRemaining = Math.max(this.startRemaining, remaining)
+      // 100% is only honest once the row is actually on screen. "No paging
+      // needed" means the host only has to scroll, which we cannot measure -
+      // report that as indeterminate instead of a fake 100%.
+      if (findRow(this.targetID)) {
+        setJumpProgress(1)
         setJumpEta(0)
         return 0
       }
-      const etaSec = Math.round((remainingPages * this.pageMs) / 1000)
-      setJumpEta(etaSec)
+      if (remaining === 0) {
+        setJumpProgress(null)
+        setJumpEta(null)
+        return null
+      }
+      setJumpProgress(Math.min(0.97, Math.max(0, 1 - remaining / this.startRemaining)))
+      const perPage = Math.max(1, this.turnsPerPage)
+      const etaSec = Math.round((Math.ceil(remaining / perPage) * this.pageMs) / 1000)
+      setJumpEta(Math.max(1, etaSec))
       return etaSec
     },
-    remainingTurns: 0,
   }
 
-  // Starts (or retargets) the estimator for a jump/prewarm.
+  // Starts (or retargets) the estimator for a jump.
+  //
+  // The target must be a real index in the FULL turn list. If it is not (e.g.
+  // the list walk has not finished yet), clear the estimate instead of leaving
+  // the PREVIOUS target's numbers on screen - that stale state is how a
+  // 7-turn session ended up showing "100% · 还需 <1s" forever.
   const etaStart = (targetID) => {
     const list = untrack(turns)
     const index = list.findIndex((t) => t.id === targetID)
-    if (index < 0) return
+    if (index < 0) {
+      eta.targetID = ""
+      etaStop()
+      return
+    }
     eta.reset(targetID, index, list.length)
     eta.update()
   }
@@ -1241,6 +1333,10 @@ function Rail(props) {
     // what makes a deep jump advance only one page per click. The header
     // already shows the progress, so just leave it running.
     if (jumping() && busyID() === turn.id) return
+    // The host will be seeking/scrolling for a while: keep the prewarm out.
+    // (After a successful jump the user is reading history anyway, which
+    // already blocks prewarming; this only covers the alignment window.)
+    jumpQuietUntil = Date.now() + 5000
 
     const path = routePath(ctx)
     const sc = scroller()
@@ -1287,7 +1383,6 @@ function Rail(props) {
     setJumpPages(0)
     setJumpElapsed(0)
     setJumpChain(0)
-    setWaitWarm(warming())
     // Pin the panel open even if the pointer has left it meanwhile.
     setOpen(true)
     const startedAt = Date.now()
@@ -1298,30 +1393,14 @@ function Rail(props) {
     // the per-chain counter, the headline must not go backwards).
     let chainBase = 0
     try {
-      // A prewarm is already paging the history (it seeks the oldest turn, so
-      // it passes through this one on the way). Don't fight it with a competing
-      // seek: just wait for the row to mount, then land. The header reads
-      // "预热中 · 稍等一下" while we wait.
+      // A prewarm may be paging history in. Take the viewport over from it
+      // immediately instead of waiting: the user asked for a specific message,
+      // and a prewarm can hold the viewport for up to 30s. Its guard stops the
+      // moment the token moves (cancelWarm), so the two never fight - and any
+      // history it already paged in stays in the host's store, so the seek
+      // below is faster than it would have been.
       if (warming()) {
-        // No cold-start kick here: the running prewarm owns the hash and has
-        // its own kick loop; competing toggles would fight it.
-        etaStart(turn.id)
-        const landed = await waitForRow(turn.id, token, 20000, (pages) => {
-          setJumpPages(pages)
-          if (pages > eta.lastPages) etaPage()
-        })
-        if (token !== jumpToken || sessionID() !== sessionAtJump) return
-        if (landed) {
-          cancelWarm()
-          navTo(path, turn.id)
-          alignAfterLand(landed)
-          pulse(landed)
-          return
-        }
-        // The prewarm ran out without mounting the row: fall back to driving
-        // the host's seek ourselves below.
-        if (warming()) cancelWarm()
-        setWaitWarm(false)
+        cancelWarm()
         if (token !== jumpToken || sessionID() !== sessionAtJump) return
       }
 
@@ -1366,7 +1445,7 @@ function Rail(props) {
             // Progress is shown in the panel header, not in a toast.
             setJumpPages(chainBase + pages)
             // One fingerprint change == one page landed: feed the ETA.
-            if (pages > eta.lastPages) etaPage()
+            etaPage()
           },
           // Cold start: the host dropped our seek (its machine activates only
           // after the timeline is ready). Bounce the hash through a mounted
@@ -1400,7 +1479,6 @@ function Rail(props) {
         setJumpElapsed(0)
         setJumpChain(0)
         setBusyID("")
-        setWaitWarm(false)
       }
     }
   }
@@ -1413,39 +1491,129 @@ function Rail(props) {
   // and restore the viewport afterwards. Once the store holds the whole
   // history every jump is instant.
   const [warming, setWarming] = createSignal(false)
-  let warmToken = 0
-  let warmedFor = ""
-  // Set when a prewarm gave up without reaching the oldest turn (the host never
-  // engaged). The auto-resume effect must not retry it in a loop; an explicit
-  // hover or a fresh full load still may.
-  let warmBlockedFor = ""
 
-  // The topmost visible row plus its offset, so the viewport can be restored.
-  const viewAnchor = () => {
-    const sc = scroller()
-    if (!sc) return undefined
-    const scRect = sc.getBoundingClientRect()
-    for (const row of sc.querySelectorAll("[data-message-id]")) {
-      const rect = row.getBoundingClientRect()
-      if (rect.bottom <= scRect.top + 1) continue
-      const mid = row.getAttribute("data-message-id")
-      if (!mid) continue
-      return { el: row, id: mid, offset: rect.top - scRect.top }
-    }
-    return undefined
+  // ---- viewport intent ----------------------------------------------------
+  // Prewarm works by asking the host to seek the OLDEST message, so the host
+  // necessarily scrolls the timeline. Two rules keep that invisible:
+  //
+  //   1. the viewport is put back before the browser paints (scroll listener +
+  //      animation frame), so the seek is never rendered;
+  //   2. the moment a human touches the viewport the prewarm yields - fighting
+  //      a real scroll is what produced the "jitter / can't scroll up" bug.
+  // A held pointer blocks prewarm, but a drag that ends outside the window
+  // never fires pointerup here: expire it so prewarm cannot stall forever.
+  const pointerBusy = () => pointerHeld && Date.now() - pointerHeldAt < 15000
+
+  const userBusy = () =>
+    pointerBusy() || Date.now() < userActiveUntil || Date.now() - lastEventAt < EVENT_QUIET_MS
+
+  // Records human intent on the viewport and, if a prewarm is mid-flight, makes
+  // it yield immediately (it resumes on its own once the human goes idle).
+  const noteUserIntent = () => {
+    userActiveUntil = Date.now() + USER_IDLE_MS
+    if (untrack(warming)) yieldWarm()
   }
 
-  const restoreView = (anchor) => {
-    if (!anchor) return
+  onMount(() => {
+    const inRail = (event) => {
+      const path = event.composedPath?.() ?? []
+      return path.some((node) => node instanceof Element && node.closest?.(".sr-rail"))
+    }
+    const onWheel = (event) => {
+      if (inRail(event)) return
+      noteUserIntent()
+    }
+    const onPointerDown = (event) => {
+      if (inRail(event)) return
+      // Holding the button means a drag (scrollbar, text selection): prewarm
+      // must not fight it for as long as it lasts.
+      pointerHeld = true
+      pointerHeldAt = Date.now()
+      noteUserIntent()
+    }
+    const onPointerUp = () => {
+      if (!pointerHeld) return
+      pointerHeld = false
+      userActiveUntil = Math.max(userActiveUntil, Date.now() + 400)
+    }
+    const onTouch = (event) => {
+      if (inRail(event)) return
+      noteUserIntent()
+    }
+    const onKey = (event) => {
+      if (
+        event.key === "PageUp" ||
+        event.key === "PageDown" ||
+        event.key === "Home" ||
+        event.key === "End" ||
+        event.key === "ArrowUp" ||
+        event.key === "ArrowDown" ||
+        event.key === " "
+      ) {
+        noteUserIntent()
+      }
+    }
+    // Passive + capture: we never preventDefault, we only observe.
+    document.addEventListener("wheel", onWheel, { capture: true, passive: true })
+    document.addEventListener("touchstart", onTouch, { capture: true, passive: true })
+    document.addEventListener("pointerdown", onPointerDown, true)
+    document.addEventListener("pointerup", onPointerUp, true)
+    document.addEventListener("pointercancel", onPointerUp, true)
+    window.addEventListener("keydown", onKey, true)
+    onCleanup(() => {
+      document.removeEventListener("wheel", onWheel, true)
+      document.removeEventListener("touchstart", onTouch, true)
+      document.removeEventListener("pointerdown", onPointerDown, true)
+      document.removeEventListener("pointerup", onPointerUp, true)
+      document.removeEventListener("pointercancel", onPointerUp, true)
+      window.removeEventListener("keydown", onKey, true)
+    })
+  })
+
+  const snapshotView = () => {
     const sc = scroller()
-    if (!sc) return
-    // Prefer the element itself: an assistant row can carry the same message
-    // id, so looking it up by id might land on a different element.
-    const row = anchor.el?.isConnected ? anchor.el : findRow(anchor.id)
-    if (!row) return
-    const scRect = sc.getBoundingClientRect()
-    const delta = row.getBoundingClientRect().top - scRect.top - anchor.offset
-    if (Math.abs(delta) > 2) sc.scrollTop += delta
+    if (!sc) return undefined
+    const fromBottom = sc.scrollHeight - sc.scrollTop - sc.clientHeight
+    return { fromBottom, atBottom: fromBottom <= 24 }
+  }
+
+  // User is reading history (not parked at the bottom of the timeline).
+  const readingHistory = () => {
+    const snap = snapshotView()
+    return !!snap && !snap.atBottom
+  }
+
+  // Builds the "hold the viewport still" guard used while the host is paging.
+  //
+  // Why bottom-only: prewarming asks the host to seek the OLDEST message, so
+  // the host always scrolls away from where the user is. Restoring an arbitrary
+  // mid-history position needs an anchor row, and the virtual list recycles
+  // rows while older history is prepended - the old fallback then recomputed a
+  // position near the bottom on every tick, which is exactly the "jitter, stuck
+  // at the bottom, cannot scroll up" report.
+  //
+  // Pinning to the BOTTOM instead is stable and needs no anchor: the bottom is
+  // a well-defined coordinate even while content grows, and a user who is
+  // already at the bottom sees nothing move. Users reading mid-history are
+  // never prewarmed at all (see prewarm), so their viewport is never touched.
+  //
+  // The guard runs from the scroll listener (synchronously, before paint) and
+  // from rAF, so the host's seek is never actually rendered.
+  const makeGuard = (targetID) => {
+    const state = { stopped: false, landed: false }
+    const apply = () => {
+      if (state.stopped) return
+      const sc = scroller()
+      if (!sc) return
+      // Probe BEFORE restoring: restoring the viewport unmounts the row the
+      // host just seeked to, so this is the only moment the mount is visible.
+      if (targetID && !state.landed && findRow(targetID)) state.landed = true
+      if (sc.scrollHeight - sc.scrollTop - sc.clientHeight > 1) sc.scrollTop = sc.scrollHeight
+    }
+    const stop = () => {
+      state.stopped = true
+    }
+    return { apply, stop, landed: () => state.landed }
   }
 
   const cancelWarm = () => {
@@ -1454,14 +1622,86 @@ function Rail(props) {
     if (!jumping()) etaStop()
   }
 
+  // A human is driving the viewport: give up this attempt but keep the session
+  // eligible for a later one (unlike warmBlockedFor, which means "never").
+  const yieldWarm = () => {
+    if (!untrack(warming)) return
+    cancelWarm()
+    scheduleWarmRetry(1500)
+  }
+
+  const scheduleWarmRetry = (delay) => {
+    if (warmRetryTimer) return
+    const sid = sessionID()
+    if (!sid || warmedFor === sid || warmBlockedFor === sid) return
+    if (jumping()) return
+    if (Date.now() > warmRetryUntil) return
+    warmRetryTimer = setTimeout(() => {
+      warmRetryTimer = undefined
+      maybePrewarm()
+    }, delay)
+  }
+
+  // "The host already holds every turn" - the only condition under which a
+  // prewarm seek is pointless. Deliberately NOT `findRow(oldest)`: the
+  // timeline is virtualized, so the oldest row can be missing from the DOM
+  // even though nothing needs paging in. Using findRow() there made every
+  // short session look cold, and the resulting seek is what made the plugin
+  // and the host fight over the scroll position.
+  const historyComplete = () => {
+    const list = untrack(turns)
+    if (list.length === 0) return false
+    // Only meaningful once the whole turn list is known: with a partially
+    // walked list, index 0 is not the oldest turn of the session.
+    if (listCompleteFor !== untrack(sessionID)) return false
+    for (let i = 0; i < list.length; i++) if (findRow(list[i].id)) return i === 0
+    return false
+  }
   // Prewarm once per session, right after the turn list loads (or on hover /
-  // /turns). Every session gets it: the warm cost for a short session is one
-  // cheap host page, and it guarantees the first click lands instantly.
+  // /turns). Every session that actually needs paging gets it: the warm cost
+  // for a short session is one cheap host page, and it guarantees the first
+  // click lands instantly.
+  //
+  // It only starts when the timeline is actually mounted (the host drops seeks
+  // issued before its seek machine is ready - that used to cost the first
+  // click 12s of dead air) and when nobody is using the viewport.
   const maybePrewarm = () => {
     const sid = sessionID()
     if (!sid || warming()) return
-    if (warmedFor === sid) return
+    // A jump owns the hash and the viewport: starting a prewarm now would
+    // cancel the host's in-flight seek (that is what made deep jumps advance
+    // one page per click). The resume effect below can fire right after a jump
+    // cancelled the prewarm, so this guard is load-bearing.
+    if (jumping()) return
+    // Same window, one level weaker: a jump that already finished still leaves
+    // the host scrolling/aligning for a moment. Reschedule instead of dropping
+    // the prewarm, otherwise a single click could end warming for the session.
+    if (Date.now() < jumpQuietUntil) {
+      scheduleWarmRetry(Math.max(600, jumpQuietUntil - Date.now() + 200))
+      return
+    }
+    if (warmedFor === sid || warmBlockedFor === sid) return
     if (turns().length < 1 && !oldestProbe) return
+    if (historyComplete()) {
+      warmedFor = sid
+      return
+    }
+    const sc = scroller()
+    if (!sc || !sc.querySelector("[data-message-id]")) {
+      // Timeline not mounted yet: try again shortly instead of burning a seek.
+      scheduleWarmRetry(800)
+      return
+    }
+    if (userBusy()) {
+      scheduleWarmRetry(WARM_RETRY_DELAY_MS)
+      return
+    }
+    // Never prewarm while the user is reading history: the seek would move
+    // their viewport. Retry later in case they scroll back to the bottom.
+    if (readingHistory()) {
+      scheduleWarmRetry(3000)
+      return
+    }
     void prewarm()
   }
 
@@ -1470,27 +1710,59 @@ function Rail(props) {
     const path = routePath(ctx)
     const sid = sessionID()
     if (!path || !sid) return
-    // Target: the oldest known turn. Prefer the full list's head; fall back
-    // to the asc probe so prewarm can run before the list walk finishes.
-    let oldest = turns()[0]
-    if (!oldest && oldestProbe) {
-      oldest = { id: oldestProbe, created: 0, text: "" }
-    }
+    // Target: the real oldest turn. `turns()[0]` is only trustworthy once the
+    // list walk reached the end of the history; before that the head is just
+    // the oldest of the pages fetched so far, and the asc probe is correct.
+    let oldest = listCompleteFor === sid ? turns()[0] : undefined
+    if (!oldest && oldestProbe) oldest = { id: oldestProbe, created: 0, text: "" }
+    if (!oldest) oldest = turns()[0]
     if (!oldest) return
-    // Already warm: the oldest turn is mounted, so the store has the history.
-    if (findRow(oldest.id)) {
-      warmedFor = sid
+    if (warmedFor === sid) return
+    // Prewarming necessarily scrolls the host to the oldest message, so it is
+    // only allowed when the user is parked at the BOTTOM: pinning back to the
+    // bottom is then a no-op for them. Anyone reading older messages is left
+    // alone (see maybePrewarm, which never even starts in that case).
+    const snap = snapshotView()
+    if (!snap) {
+      scheduleWarmRetry(800)
       return
     }
-    if (warmedFor === sid) return
+    if (!snap.atBottom) return
+    // The host may still be paging: the deadline is the only budget needed now
+    // that the guard pins the viewport and progress is measured by content
+    // growth (which stops the attempt as soon as the host goes quiet).
+    const deadlineMs = 30000
+    const kickBudget = 4
     const token = ++warmToken
-    const anchor = viewAnchor()
-    const sc = scroller()
-    const wasAtBottom = sc ? sc.scrollTop + sc.clientHeight >= sc.scrollHeight - 32 : true
     setWarming(true)
-    // Surface the warm-up in the same progress header a jump uses, so an
-    // early click shows a live estimate instead of just "稍等一下".
-    etaStart(oldest.id)
+    // No percentage during a prewarm: the viewport is pinned to the bottom, so
+    // the mounted rows never advance and any "progress" we computed from them
+    // was fiction - that is where the "预热中 · 100% · 还需 <1s" while still
+    // paging came from. The header shows an indeterminate bar instead. A
+    // determinate ETA is only shown for user-initiated jumps, where the host
+    // really does move the viewport through the history.
+    eta.targetID = ""
+    etaStop()
+    // Hold the viewport still while the host pages. rAF is not enough on its
+    // own: the host may scroll and paint between frames, so a scroll listener
+    // runs the same guard synchronously. Both are cheap (a rect read + one
+    // write, and only when something actually moved).
+    const guard = makeGuard(oldest.id)
+    const sc = scroller()
+    // Gate the scroll listener on the token: a user scroll cancels the prewarm
+    // synchronously, but this listener may still fire before the loop's finally
+    // runs - pinning then would fight the user exactly once.
+    const onScroll = () => {
+      if (token === warmToken) guard.apply()
+    }
+    sc?.addEventListener("scroll", onScroll, { passive: true })
+    let raf = 0
+    const guardStep = () => {
+      if (token !== warmToken) return
+      guard.apply()
+      raf = requestAnimationFrame(guardStep)
+    }
+    raf = requestAnimationFrame(guardStep)
     try {
       navTo(path, oldest.id)
       // The host's seek machine starts inactive and DROPS a seek issued before
@@ -1499,58 +1771,82 @@ function Rail(props) {
       // the host goes silent, bounce the hash to re-engage it once it is ready.
       // If it never engages, bail fast (without marking warm) so clicks fall
       // back to a direct jump instead of all showing "预热中 · 稍等一下" for 2min.
-      const deadline = Date.now() + 30000
-      let lastSig = rowSignature()
+      const deadline = Date.now() + deadlineMs
+      // Progress signal for a prewarm CANNOT be the mounted-row fingerprint:
+      // the guard pins the viewport to the bottom, so the visible rows stay
+      // identical even while the host pages. Prepending older history grows the
+      // scroll height, which is the honest signal here.
+      const contentHeight = () => scroller()?.scrollHeight ?? 0
+      let lastHeight = contentHeight()
       let lastChange = Date.now()
       let kicks = 0
-      const keep = setInterval(() => restoreView(anchor), 150)
-      try {
-        while (Date.now() < deadline && token === warmToken) {
-          if (findRow(oldest.id)) break
-          await sleep(250)
-          if (token !== warmToken) break
-          const now = Date.now()
-          const sig = rowSignature()
-          if (sig !== lastSig) {
-            // Real progress: the host is paging. Keep waiting, reset the kick budget.
-            lastSig = sig
-            lastChange = now
-            kicks = 0
-            etaPage()
-          } else if (now - lastChange > 3000) {
-            if (kicks >= 4) break // host never engaged: give up, stay un-warm
-            // Re-engage: a repeated identical hash is ignored by the router, so
-            // bounce through a mounted turn first, then back to the oldest.
-            const other = oldestLoadedTurn()
-            if (other && other.id !== oldest.id) {
-              navTo(path, other.id)
-              await sleep(JUMP_TOGGLE_DWELL_MS)
-              if (token !== warmToken) break
-            }
-            navTo(path, oldest.id)
-            lastChange = Date.now()
-            kicks++
-          }
+      let progressed = false
+      while (Date.now() < deadline && token === warmToken) {
+        // The guard probes for the target before restoring: restoring the
+        // viewport unmounts that row, so this is the only reliable moment.
+        if (guard.landed()) break
+        await sleep(250)
+        if (token !== warmToken) break
+        if (guard.landed()) break
+        // The human took the viewport back: stop driving it.
+        if (userBusy()) {
+          yieldWarm()
+          return
         }
-      } finally {
-        clearInterval(keep)
+        const now = Date.now()
+        const height = contentHeight()
+        if (height > lastHeight) {
+          // Older history was prepended: the host is paging. Keep waiting and
+          // reset the kick budget.
+          lastHeight = height
+          lastChange = now
+          kicks = 0
+          progressed = true
+        } else if (now - lastChange > 3000) {
+          // The host has gone quiet. If it paged at all, the history it needed
+          // is in its store - stop now instead of holding the viewport for the
+          // rest of the deadline. Only a host that never paged needs a kick.
+          if (progressed) break
+          if (kicks >= kickBudget) break // host never engaged: give up, stay un-warm
+          // Re-engage: a repeated identical hash is ignored by the router, so
+          // bounce through a mounted turn first, then back to the oldest.
+          const other = oldestLoadedTurn()
+          if (other && other.id !== oldest.id) {
+            navTo(path, other.id)
+            await sleep(JUMP_TOGGLE_DWELL_MS)
+            if (token !== warmToken) break
+          }
+          navTo(path, oldest.id)
+          lastChange = Date.now()
+          kicks++
+        }
       }
       if (token !== warmToken) return
-      const done = !!findRow(oldest.id)
-      // The host scrolled to the oldest message; put the viewport back.
-      restoreView(anchor)
-      if (wasAtBottom) {
-        const live = scroller()
-        if (live) live.scrollTop = live.scrollHeight
-      }
+      // The host pages *toward* the seek target, which here is the oldest turn:
+      // once it has paged at all and then gone quiet, the history it needed is
+      // in its store. Treat that as warm too - the alternative is retrying,
+      // which re-pins the viewport to the bottom for no extra pages.
+      const done = guard.landed() || progressed
+      // Final correction: the host left the viewport at the seek target.
+      guard.apply()
       if (done) {
         warmedFor = sid
-      } else {
-        // Never claim the history is ready when the oldest turn never mounted.
+        warmFailures = 0
+      } else if (warmFailures >= 1) {
+        // Second failure: stop trying automatically. A failed prewarm must not
+        // permanently poison the session, but it must not loop either.
         warmBlockedFor = sid
+      } else {
+        // One retry later: the host may simply have been busy or the timeline
+        // may still have been warming up. Retrying once costs nothing.
+        warmFailures++
+        scheduleWarmRetry(4000)
       }
       // Silent on success: prewarming is an implementation detail.
     } finally {
+      cancelAnimationFrame(raf)
+      guard.stop()
+      sc?.removeEventListener("scroll", onScroll)
       if (token === warmToken) {
         setWarming(false)
         // Keep a jump's ETA alive if one is riding the prewarm; otherwise clear.
@@ -1575,7 +1871,6 @@ function Rail(props) {
     setJumpEta(null)
     setJumpProgress(null)
     setBusyID("")
-    setWaitWarm(false)
   })
 
   // Resume the prewarm after a jump interrupted it, so the remaining older
@@ -1588,7 +1883,11 @@ function Rail(props) {
     const sid = sessionID()
     const count = turns().length
     const hot = warming()
-    if (!sid || count < 1 || hot || warmedFor === sid || warmBlockedFor === sid) return
+    // `jumping()` is read on purpose: when a jump cancels the prewarm, this
+    // effect re-runs with hot=false and would immediately restart the prewarm,
+    // stealing the hash back from the jump in flight.
+    const busy = jumping()
+    if (!sid || count < 1 || hot || busy || warmedFor === sid || warmBlockedFor === sid) return
     if (loadingActive || loadedFor !== sid) return
     const timer = setTimeout(() => maybePrewarm(), 400)
     onCleanup(() => clearTimeout(timer))
@@ -1700,7 +1999,7 @@ function Rail(props) {
             }
           >
             <span class="sr-title sr-progress">
-              {waitWarm() ? "预热中" : "加载历史中"}
+              {"加载历史中"}
               {jumpProgress() != null ? ` · ${Math.round(jumpProgress() * 100)}%` : ""}
               {jumpEta() != null ? ` · 还需 ~${jumpEta() > 0 ? jumpEta() : "<1"}s` : ""}
               {jumpPages() > 0 ? ` · ${jumpPages()} 页` : ""}
@@ -1803,7 +2102,7 @@ function Rail(props) {
                     {turn.text}
                   </span>
                   <Show when={jumping() && busyID() === turn.id}>
-                    <span class="sr-badge">{waitWarm() ? "稍等" : "加载中"}</span>
+                    <span class="sr-badge">加载中</span>
                   </Show>
                   <span class="sr-dash" />
                 </button>
