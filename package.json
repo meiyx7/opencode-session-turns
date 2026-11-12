@@ -38,6 +38,8 @@
     "node": ">=20"
   },
   "scripts": {
+    "test": "node --conditions=browser --test tests/*.test.mjs",
+    "test:browser": "node scripts/test-browser.mjs",
     "build": "vite build",
     "dev": "vite build --watch",
     "prepublishOnly": "node scripts/ensure-ci-publish.mjs && npm run build"
