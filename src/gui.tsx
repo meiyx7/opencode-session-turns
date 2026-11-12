@@ -492,17 +492,38 @@ const CSS = `
   white-space: nowrap;
 }
 .sr-note {
-  display: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
   font-size: 11px;
-  opacity: .4;
+  color: var(--text-base, rgba(127,127,127,1));
+  opacity: .85;
   padding: 2px;
 }
-.sr-rail[data-open="true"] .sr-note { display: block; }
+.sr-rail[data-open="true"] .sr-note { display: flex; }
+.sr-note-hint { opacity: .75; }
+.sr-note-action {
+  align-self: flex-start;
+  border: 1px solid rgba(127,127,127,.35);
+  background: transparent;
+  color: inherit;
+  border-radius: 5px;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.sr-note-action:hover { border-color: rgba(127,127,127,.6); }
 .sr-foot {
   flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
   font-size: 11px;
   line-height: 1.5;
-  color: rgba(255,170,60,.92);
+  /* 评审 T06：状态文字用主题前景色，不再借用橙色的“警示”观感；
+     失败语义由重试按钮和文字本身承担。 */
+  color: var(--text-base, rgba(127,127,127,1));
   padding: 6px 2px 0;
   margin-top: 6px;
   border-top: 1px solid rgba(127,127,127,.2);
@@ -510,6 +531,17 @@ const CSS = `
   max-height: 64px;
   overflow: hidden;
 }
+.sr-foot-action {
+  flex: none;
+  border: 1px solid rgba(127,127,127,.4);
+  background: transparent;
+  color: inherit;
+  border-radius: 5px;
+  font-size: 11px;
+  padding: 1px 8px;
+  cursor: pointer;
+}
+.sr-foot-action:hover { background: rgba(127,127,127,.12); }
 .sr-status {
   position: fixed;
   right: 42px;
@@ -603,12 +635,17 @@ function Rail(props) {
       }
       setNote(cache.size ? "" : "暂无用户消息")
       lastNote = ""
+      clearFailure()
       schedulePrewarm()
     }).catch((error) => {
       if (disposed || controller.signal.aborted || key !== untrack(sessionKey)) return
       lastNote = String(error?.message ?? error)
       setNote(cache.size ? "" : lastNote)
-      if (cache.size) flash(`轮次更新失败：${lastNote}`)
+      // 目录加载失败：面板内保留可点的重试，而不是只闪一句就消失。
+      reportFailure(`轮次目录加载失败：${lastNote}`, () => {
+        listComplete = false
+        void load(false)
+      })
     }).finally(() => {
       if (loadTask === task) loadTask = undefined
     })
@@ -735,6 +772,21 @@ function Rail(props) {
     }, ms)
   }
 
+  // 评审 T09：失败不能只留一句话——状态栏跟着一个对应的重试动作。
+  // lastFailure 记住“失败的是什么”（目录加载或某次定位），按钮按需出现。
+  const [failure, setFailure] = createSignal(null)
+  const reportFailure = (text, retry) => {
+    setFailure({ text, retry })
+    flash(text, 4200)
+  }
+  const clearFailure = () => setFailure(null)
+  const retryFailure = () => {
+    const current = failure()
+    if (!current) return
+    clearFailure()
+    current.retry()
+  }
+
   // ---- open / close interactions ------------------------------------------
   onMount(() => {
     const onKey = (event) => {
@@ -775,12 +827,23 @@ function Rail(props) {
 
   onMount(() => {
     const onDiag = () => flash(`${VERSION} · ${diagnostics(ctx)}`)
-    // /turns toggles the panel; ⌘⌥P / the pin button toggles "pinned" (stay
+    // /turns toggles the panel; the pin button / /turns-pin toggles "pinned" (stay
     // open when the pointer leaves). Esc / outside click / × still close an
     // unpinned panel.
     const onOpen = () => {
-      setOpen((value) => !value)
+      const next = !untrack(open)
+      setOpen(next)
       maybePrewarm()
+      // 评审 T07：键盘打开面板时把焦点带进面板，落点优先搜索框，否则列表。
+      if (next) {
+        requestAnimationFrame(() => {
+          if (searchInput) {
+            searchInput.focus()
+          } else {
+            document.querySelector(".sr-list")?.focus?.()
+          }
+        })
+      }
     }
     const onPin = () => {
       setPinned((value) => !value)
@@ -909,11 +972,15 @@ function Rail(props) {
       }
       if (!current()) return
       if (row) {
+        clearFailure()
         alignAfterLand(row, current)
         pulse(row)
       } else {
         navClear(path)
-        flash(native ? "历史已加载，界面暂未完成定位，请重试" : "宿主分页定位超时，请重试")
+        reportFailure(
+          native ? "历史已加载，界面暂未完成定位" : "宿主分页定位超时",
+          () => void jump(turn),
+        )
       }
     } catch (error) {
       if (current() && error?.name !== "AbortError") flash(String(error?.message ?? error))
@@ -996,6 +1063,26 @@ function Rail(props) {
     const needle = query().trim().toLowerCase()
     if (!needle) return list
     return list.filter((turn) => turn.text.toLowerCase().includes(needle))
+  })
+
+  // 面板空态分类（评审 T03）：初始加载、会话无提问、搜索零匹配、加载失败
+  // 是四种不同的事实，不能共用一个版本号回退。
+  const emptyState = createMemo(() => {
+    if (visibleTurns().length > 0) return null
+    if (query().trim()) {
+      return {
+        text: `未找到包含「${query().trim()}」的提问`,
+        hint: "搜索只匹配每条提问的第一行",
+        action: "清除搜索",
+        run: () => {
+          setQuery("")
+          clearCursor()
+        },
+      }
+    }
+    if (note()) return { text: note(), hint: "", action: "重试", run: () => void load(false) }
+    if (!listComplete) return { text: "正在加载提问…", hint: "", action: "", run: null }
+    return { text: "这个会话还没有用户提问", hint: "", action: "", run: null }
   })
 
   // The row the ↑/↓ keys currently point at (index within visibleTurns).
@@ -1104,7 +1191,7 @@ function Rail(props) {
               type="button"
               class="sr-iconbtn"
               data-on={pinned() ? "true" : "false"}
-              title={pinned() ? "取消固定 (⌘⌥P)" : "固定面板 (⌘⌥P)"}
+              title={pinned() ? "取消固定" : "固定面板（保持展开）"}
               aria-label={pinned() ? "取消固定面板" : "固定面板"}
               aria-pressed={pinned() ? "true" : "false"}
               onClick={() => setPinned(!pinned())}
@@ -1143,7 +1230,8 @@ function Rail(props) {
               ref={searchInput}
               type="text"
               class="sr-search-input"
-              placeholder="搜索轮次…"
+              placeholder="搜索提问首行…"
+              aria-label="搜索提问首行"
               value={query()}
               onInput={(event) => {
                 setQuery(event.currentTarget.value)
@@ -1172,7 +1260,7 @@ function Rail(props) {
           onKeyDown={listKeyDown}
           tabIndex={-1}
         >
-          <Show when={visibleTurns().length > 0} fallback={<div class="sr-note">{note() || `… ${VERSION}`}</div>}>
+          <Show when={emptyState()} fallback={
             <For each={visibleTurns()}>
               {(turn, index) => (
                 <button
@@ -1182,6 +1270,7 @@ function Rail(props) {
                   data-cursor={cursorIndex() === index() ? "true" : "false"}
                   data-busy={jumping() && busyID() === turn.id ? "true" : "false"}
                   data-index={index()}
+                  aria-current={active() === turn.id ? "true" : undefined}
                   onClick={() => void jump(turn)}
                 >
                   <span class="sr-text">
@@ -1196,13 +1285,32 @@ function Rail(props) {
                 </button>
               )}
             </For>
+          }>
+            {(empty) => (
+              <div class="sr-note" role="status">
+                <div>{empty().text}</div>
+                <Show when={empty().hint}>
+                  <div class="sr-note-hint">{empty().hint}</div>
+                </Show>
+                <Show when={empty().action}>
+                  <button type="button" class="sr-note-action" onClick={() => empty().run?.()}>
+                    {empty().action}
+                  </button>
+                </Show>
+              </div>
+            )}
           </Show>
         </div>
         {/* Messages that need attention (errors, cancel confirmations) live in
             the panel footer while it is open, and next to the collapsed rail
             when it is closed - the old bottom-right toast was easy to miss. */}
-        <Show when={open() && status()}>
-          <div class="sr-foot">{status()}</div>
+        <Show when={open() && (failure() || status())}>
+          <div class="sr-foot" role="status">
+            <span>{failure()?.text ?? status()}</span>
+            <Show when={failure()}>
+              <button type="button" class="sr-foot-action" onClick={retryFailure}>重试</button>
+            </Show>
+          </div>
         </Show>
       </div>
       <Show when={!open() && status()}>
@@ -1226,7 +1334,7 @@ export default Plugin.define({
       "command.jump": "Session turns: show / jump",
       "command.jump.description": "Reveal the turn rail; click a turn to jump to that message",
       "command.pin": "Session turns: pin panel",
-      "command.pin.description": "Toggle pinning the turn rail open (⌘⌥P)",
+      "command.pin.description": "Toggle pinning the turn rail open; also available from the pin button",
     },
   },
   setup(ctx) {
@@ -1261,7 +1369,9 @@ export default Plugin.define({
       title: ctx.t("command.pin"),
       description: ctx.t("command.pin.description"),
       section: "navigation",
-      bind: "mod+alt+p",
+      // 评审 T01：不再占用 mod+alt+p —— 插件中心默认使用同一组合键，两个插件
+      // 同时启用时会互相覆盖。固定面板改由面板内按钮与命令面板触达，用户可在
+      // 宿主快捷键设置里自行绑定。
       slash: { name: "turns-pin" },
       run: () => {
         window.dispatchEvent(new Event(PIN_EVENT))
